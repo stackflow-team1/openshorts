@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
+import DurableJobHistory from './components/DurableJobHistory';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -322,6 +323,8 @@ function App() {
   }, [queueSlow, queueInfo]);
   // Why the last job could not start or failed, in plain words (or '').
   const [jobError, setJobError] = useState('');
+  const [jobProgress, setJobProgress] = useState(null);
+  const [retryingJob, setRetryingJob] = useState(false);
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
   // the ephemeral local /videos/ files have been cleaned up (e.g. after a reload).
   const [durableClips, setDurableClips] = useState({});
@@ -941,6 +944,7 @@ function App() {
           }
 
           if (data.partial) setPartialJob(data.partial);
+          setJobProgress(data.progress || null);
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
           nextDelay = data.status === 'queued' ? 5000 : 2000;
 
@@ -1256,6 +1260,7 @@ function App() {
     clearPendingJob();
     setStatus('processing');
     setJobError('');
+    setJobProgress(null);
     setLogs(["Starting process..."]);
     setLogTimes([Date.now() / 1000]);
     setResults(null);
@@ -1450,7 +1455,49 @@ function App() {
     setFirstVideoJob(false);
     setQueueInfo(null);
     setJobError('');
+    setJobProgress(null);
     localStorage.removeItem(SESSION_KEY);
+  };
+
+  const openDurableJob = async (id) => {
+    setJobId(id);
+    setActiveTab('dashboard');
+    setResults(null);
+    setJobError('');
+    try {
+      const data = await pollJob(id);
+      setResults(data.result || null);
+      setLogs(data.logs || []);
+      setLogTimes(data.log_times || []);
+      setJobProgress(data.progress || null);
+      setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
+      setStatus(data.status === 'completed' ? 'complete'
+        : data.status === 'failed' ? 'error' : 'processing');
+      setJobError(data.status === 'failed'
+        ? readableError(data.logs?.[data.logs.length - 1]) : '');
+      if (data.progress?.interrupted || data.progress?.recovery_message) setSessionRecovered(true);
+    } catch (e) {
+      setJobError(readableError(e.message));
+      setStatus('error');
+    }
+  };
+
+  const retryDurableJob = async (id) => {
+    setRetryingJob(true);
+    try {
+      const response = await apiFetch(`/api/jobs/${encodeURIComponent(id)}/retry`, {
+        method: 'POST',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await openDurableJob(id);
+    } catch (e) {
+      const message = readableError(e.message);
+      setJobError(message);
+      setLogs((current) => [...current, `Retry failed: ${message}`]);
+      throw new Error(message);
+    } finally {
+      setRetryingJob(false);
+    }
   };
   useEffect(() => {
     handleResetRef.current = handleReset;
@@ -2304,6 +2351,9 @@ function App() {
                   <span className="flex items-center gap-2"><Instagram size={16} /> Instagram</span>
                   <span className="flex items-center gap-2"><TikTokIcon size={16} /> TikTok</span>
                 </div>
+                {!billingEnabled && (
+                  <DurableJobHistory onOpen={openDurableJob} onRetry={retryDurableJob} />
+                )}
               </div>
               </div>
             </div>
@@ -2326,6 +2376,16 @@ function App() {
                     }>
                     {status.toUpperCase()}
                   </span>
+                  {status === 'error' && !billingEnabled && jobProgress?.retryable && (
+                    <button
+                      type="button"
+                      onClick={() => retryDurableJob(jobId)}
+                      disabled={retryingJob}
+                      className="btn-quiet px-3 py-1.5 text-xs disabled:opacity-50"
+                    >
+                      {retryingJob ? 'Retrying…' : 'Retry job'}
+                    </button>
+                  )}
                 </div>
 
                 {/* Trimmed run: say it while it renders, not only once the
@@ -2379,6 +2439,34 @@ function App() {
                       >
                         paid plans skip the line →
                       </button>
+                    )}
+                  </div>
+                )}
+
+                {jobProgress && (
+                  <div className="mb-4 rounded-card border border-rule bg-paper2 px-4 py-3 text-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-ink capitalize">
+                        {String(jobProgress.current_stage || 'starting').replaceAll('_', ' ')}
+                      </span>
+                      <span className="text-muted">{jobProgress.percent || 0}%</span>
+                    </div>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-rule">
+                      <div
+                        className="h-full bg-brass transition-all"
+                        style={{ width: `${Math.min(100, Math.max(0, jobProgress.percent || 0))}%` }}
+                      />
+                    </div>
+                    {jobProgress.total_clips > 0 && (
+                      <p className="mt-2 text-xs text-muted">
+                        {jobProgress.completed_clips} clips completed · {jobProgress.pending_clips} pending
+                        {jobProgress.failed_clips ? ` · ${jobProgress.failed_clips} failed` : ''}
+                      </p>
+                    )}
+                    {(jobProgress.interrupted || jobProgress.recovery_message) && (
+                      <p role="status" className="mt-2 text-xs text-brass">
+                        {jobProgress.recovery_message || 'This job was interrupted by an environment restart and is resuming from saved work.'}
+                      </p>
                     )}
                   </div>
                 )}

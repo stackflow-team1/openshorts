@@ -2277,7 +2277,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None, checkpoint=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2337,6 +2337,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         heat = twitch_signals.window_heat(windows, viewer_clips) if viewer_clips else {}
         if heat:
             print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
+        if checkpoint:
+            checkpoint("gemini_scoring", "started")
 
         def _payload(ws):
             out = []
@@ -2375,6 +2377,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             if added:
                 print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
+        if checkpoint:
+            checkpoint("gemini_scoring", "completed")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
         min_clips, max_clips = clip_count_targets(len(shortlist))
@@ -2390,6 +2394,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
+        if checkpoint:
+            checkpoint("gemini_detailed_analysis", "started")
         shorts = _run_stage_split(client, model_name, shortlist,
                                   _detail_prompt_for(min_clips, max_clips),
                                   gemini_worker.DetailResponse, "shorts", costs, "detail")
@@ -2424,6 +2430,9 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             shorts = trim_to_best(shorts, max_clips)
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
+        if checkpoint:
+            checkpoint("gemini_detailed_analysis", "completed")
+            checkpoint("clip_selection", "started")
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
@@ -2438,6 +2447,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
                   f"better-scored one.")
             shorts = deduped
+        if checkpoint:
+            checkpoint("clip_selection", "completed")
 
         # Aggregate cost across both passes.
         cost_analysis = None
@@ -2865,6 +2876,48 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
+    checkpoint_path = os.path.join(output_dir, ".pipeline-checkpoints.json")
+    checkpoint_lock = threading.Lock()
+    try:
+        with open(checkpoint_path, encoding="utf-8") as f:
+            pipeline_checkpoints = json.load(f)
+    except (OSError, ValueError):
+        pipeline_checkpoints = {"stages": {}, "clips": {}}
+
+    def _save_pipeline_checkpoints():
+        write_json_atomic(checkpoint_path, pipeline_checkpoints, indent=2)
+
+    def checkpoint_stage(name, state):
+        with checkpoint_lock:
+            pipeline_checkpoints.setdefault("stages", {})[name] = {
+                "status": state, "updated_at": time.time(),
+            }
+            _save_pipeline_checkpoints()
+        print(f"JOB_STAGE {name} {state}", flush=True)
+
+    def checkpoint_clip(index, state, filename=None):
+        with checkpoint_lock:
+            pipeline_checkpoints.setdefault("clips", {})[str(index)] = {
+                "status": state, "filename": filename, "updated_at": time.time(),
+            }
+            _save_pipeline_checkpoints()
+        suffix = f" {filename}" if filename else ""
+        print(f"JOB_CLIP {index} {state}{suffix}", flush=True)
+
+    def valid_completed_clip(path):
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return False
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30, check=True)
+            return float(probe.stdout.strip()) > 0
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+
+    checkpoint_stage("upload", "completed")
+
     # Quota-wall offer: only the first N minutes were paid for (see
     # cap_source_duration). Must run before anything reads the file.
     if os.environ.get("MAX_SOURCE_MINUTES", "").strip():
@@ -2885,6 +2938,27 @@ if __name__ == '__main__':
         if _stamp(input_video) != _before and globals().get("early") is not None:
             early["invalid"] = True  # its words cover the part that was cut off
 
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    try:
+        source_stat = os.stat(input_video)
+        source_signature = {
+            "size_bytes": source_stat.st_size,
+            "mtime_ns": source_stat.st_mtime_ns,
+            "output_format": output_format,
+        }
+    except OSError:
+        source_signature = None
+    cached_analysis_data = None
+    if source_signature:
+        try:
+            with open(metadata_file, encoding="utf-8") as f:
+                candidate = json.load(f)
+            if candidate.get("source_signature") == source_signature and candidate.get("shorts"):
+                cached_analysis_data = candidate
+                print("♻️ Reusing saved Gemini analysis and clip selection.")
+        except (OSError, ValueError):
+            pass
+
     if args.prepare_only:
         # The source is on disk as every later stage must see it (downloaded,
         # cut to what was reserved). A remote worker takes it from here
@@ -2899,7 +2973,7 @@ if __name__ == '__main__':
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    if layout_picker.ENABLED and not cached_analysis_data:
         try:
             _cap = cv2.VideoCapture(input_video)
             _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -2921,8 +2995,9 @@ if __name__ == '__main__':
     # Subtitles already burned into the source: trim them off each cut clip so
     # our captions are the only text layer (burned_subtitles.py). Only when we
     # caption at all, and never on a vertical source, which is passed through.
-    source_subtitle_band = None
+    source_subtitle_band = ((cached_analysis_data or {}).get("source_subtitle_band"))
     if (not args.skip_analysis
+            and not cached_analysis_data
             and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
         try:
             import burned_subtitles
@@ -2954,11 +3029,22 @@ if __name__ == '__main__':
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = frame_count / fps
         cap.release()
+        checkpoint_stage("metadata_extraction", "completed")
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).
         from transcribe_backends import NoAudioError
-        transcript = None
+        transcript = ((cached_analysis_data or {}).get("transcript")
+                      if cached_analysis_data else None)
+        if cached_analysis_data:
+            for stage_name in ("audio_extraction", "transcription",
+                               "gemini_scoring", "gemini_detailed_analysis",
+                               "clip_selection"):
+                checkpoint_stage(stage_name, "completed")
+            clips_data = cached_analysis_data
+        else:
+            checkpoint_stage("audio_extraction", "started")
+            checkpoint_stage("transcription", "started")
         # Module handover (issue #68): another module already transcribed this
         # exact source with the same backend, so reuse its output. Any problem
         # with the file falls back to transcribing normally rather than failing.
@@ -3002,8 +3088,15 @@ if __name__ == '__main__':
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
+                checkpoint_stage("audio_extraction", "completed")
+                checkpoint_stage("transcription", "completed")
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")
+                checkpoint_stage("audio_extraction", "completed")
+                checkpoint_stage("transcription", "completed")
+        elif not cached_analysis_data:
+            checkpoint_stage("audio_extraction", "completed")
+            checkpoint_stage("transcription", "completed")
         if transcript is not None and args.url and not transcript_from_cache:
             # Kept only when this job's source is the cached file, uncut.
             import source_cache
@@ -3011,7 +3104,8 @@ if __name__ == '__main__':
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
-        if transcript is not None and speech_is_sparse(transcript, duration):
+        if (not cached_analysis_data and transcript is not None
+                and speech_is_sparse(transcript, duration)):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
                   f"switching to visual analysis.")
@@ -3019,14 +3113,27 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
+        if cached_analysis_data:
+            pass
+        elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
+            for stage_name in ("gemini_scoring", "gemini_detailed_analysis",
+                               "clip_selection"):
+                checkpoint_stage(stage_name, "completed")
         elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
+            clips_data = get_viral_clips(
+                transcript, duration, viewer_clips=viewer_clips,
+                checkpoint=checkpoint_stage)
         else:
+            for stage_name in ("gemini_scoring", "gemini_detailed_analysis",
+                               "clip_selection"):
+                checkpoint_stage(stage_name, "started")
             clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
+            for stage_name in ("gemini_scoring", "gemini_detailed_analysis",
+                               "clip_selection"):
+                checkpoint_stage(stage_name, "completed")
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -3046,16 +3153,32 @@ if __name__ == '__main__':
             # --keep-original) or in uploads/ (upload jobs).
             clips_data['source_video'] = os.path.basename(input_video)
             clips_data['output_format'] = output_format
+            clips_data['source_signature'] = source_signature
+            clips_data['source_duration'] = duration
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             write_json_atomic(metadata_file, clips_data, indent=2)
+            print("JOB_METADATA_READY", flush=True)
             print(f"   Saved metadata to {metadata_file}")
 
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+            metadata_lock = threading.Lock()
+
             def _process_one_clip(i, clip):
+                saved_output = clip.get("completed_output")
+                if (isinstance(saved_output, str)
+                        and os.path.basename(saved_output) == saved_output
+                        and saved_output.lower().endswith(".mp4")
+                        and valid_completed_clip(os.path.join(output_dir, saved_output))):
+                    print(f"♻️ Reusing completed Clip {i+1}: {saved_output}")
+                    checkpoint_clip(i, "completed", saved_output)
+                    print(f"CLIP_READY {i} {saved_output}", flush=True)
+                    return True, saved_output
+
+                checkpoint_clip(i, "processing")
                 if clip.get('pro_before'):
                     # A retry of a clip whose first attempt got as far as pro
                     # mode: start again from the range Gemini picked.
@@ -3071,6 +3194,8 @@ if __name__ == '__main__':
                 clip_final_path = os.path.join(output_dir, clip_filename)
 
                 try:
+                    checkpoint_stage("scene_detection", "started")
+                    checkpoint_stage("clip_rendering", "started")
                     # ffmpeg cut — re-encoding for precision on strict seconds
                     cut_clip(input_video, clip_temp_path, start, end, i + 1)
 
@@ -3084,6 +3209,10 @@ if __name__ == '__main__':
                     # re-dump after the pool is race-free.
                     success = render_clip(clip_temp_path, clip_final_path, output_format,
                                           subtitle_band=source_subtitle_band)
+                    checkpoint_stage(
+                        "scene_detection", "completed" if success else "failed")
+                    checkpoint_stage(
+                        "clip_rendering", "completed" if success else "failed")
                     if success:
                         print(f"   🎞️ Clip {i+1} framed")
                     deliver_path = clip_final_path
@@ -3108,6 +3237,7 @@ if __name__ == '__main__':
                         words, w_start, w_end = pro[1:]
                         cap_style = clip.get('caption_style')
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
+                    checkpoint_stage("hook_overlays", "started")
                     if success and os.environ.get("AUTO_HOOK") == "1":
                         # Captions ride the hook's ffmpeg (one decode, two
                         # outputs) when both are on; see auto_hook_clip.
@@ -3121,16 +3251,28 @@ if __name__ == '__main__':
                         if hooked:
                             deliver_path, clip['auto_hook'] = hooked
                             captioned = clip['auto_hook'].pop("_captioned", None)
+                    checkpoint_stage("hook_overlays", "completed")
                     if success:
+                        checkpoint_stage("caption_generation", "started")
                         if not captioned:
                             captioned = auto_caption_clip(
                                 deliver_path, words, w_start, w_end,
                                 split_ranges=split_ranges,
                                 mark=os.environ.get("WATERMARK") == "1",
                                 style=cap_style)
+                        checkpoint_stage("caption_generation", "completed")
+                        checkpoint_stage("final_mp4_generation", "started")
                         served = captioned or deliver_path
                         if os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
+                        if not valid_completed_clip(served):
+                            raise RuntimeError(f"Final clip {i+1} is missing or invalid")
+                        checkpoint_stage("final_mp4_generation", "completed")
+                        served_name = os.path.basename(served)
+                        with metadata_lock:
+                            clip["completed_output"] = served_name
+                            write_json_atomic(metadata_file, clips_data, indent=2)
+                        checkpoint_clip(i, "completed", served_name)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                         # Hand the API the file to actually serve for this clip.
                         # Without it the status poller guesses the clean reframe
@@ -3140,8 +3282,13 @@ if __name__ == '__main__':
                         # Printed only after the full chain (reframe, watermark,
                         # hook, captions) so the file is complete when it is
                         # announced, never one that ffmpeg is still writing.
-                        print(f"CLIP_READY {i} {os.path.basename(served)}")
-                    return success
+                        print(f"CLIP_READY {i} {served_name}", flush=True)
+                    if not success:
+                        checkpoint_clip(i, "failed")
+                    return success, os.path.basename(served) if success else None
+                except Exception as e:
+                    checkpoint_clip(i, "failed")
+                    raise
                 finally:
                     if os.path.exists(clip_temp_path):
                         os.remove(clip_temp_path)
@@ -3166,7 +3313,8 @@ if __name__ == '__main__':
                 for future in as_completed(futures):
                     i = futures[future]
                     try:
-                        if not future.result():
+                        success, _filename = future.result()
+                        if not success:
                             failed.append(i)
                     except Exception as e:
                         print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
@@ -3181,7 +3329,8 @@ if __name__ == '__main__':
                 time.sleep(CLIP_RETRY_PAUSE_SECONDS)
                 _free_gpu_cache()
                 try:
-                    if not _process_one_clip(i, shorts[i]):
+                    success, _filename = _process_one_clip(i, shorts[i])
+                    if not success:
                         print(f"   ❌ Clip {i+1} failed again.")
                 except Exception as e:
                     print(f"   ❌ Clip {i+1} failed again: {type(e).__name__}: {e}")

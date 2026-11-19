@@ -7,7 +7,28 @@ more than one core: see `multiprocess-api.md`.
 
 
 Async job queue with semaphore-based concurrency control, sized by
-`MAX_CONCURRENT_JOBS` (default 5). Jobs auto-clean after 1 hour.
+`MAX_CONCURRENT_JOBS` (default 1). Job artifacts follow the existing output
+retention policy.
+
+## Durable progress and restart recovery
+
+The queue and live job objects are in memory; durable state is not. The engine
+writes a SQLite journal to `OUTPUT_DIR/.openshorts-jobs.sqlite3`, which must be
+on workspace-backed storage. It records source metadata, timestamps, pipeline
+stages, selected clip ranges, Gemini-selected clip data, per-clip results, and
+errors. The existing per-job `.resume.json` manifest remains the source for
+re-enqueuing interrupted work and retaining reservation/delivery state.
+
+`main.py` atomically writes `.pipeline-checkpoints.json` and the metadata JSON.
+It checkpoints analysis stages and each clip independently. On a rerun, saved
+Gemini analysis and transcripts are reused; a clip is skipped only when its
+recorded final MP4 still passes the media probe. An unrecoverable record with
+no resume manifest is marked failed and can be manually retried when its
+original source is still available. Failed job data is kept. The self-hosted
+dashboard reads `/api/jobs` for recent history and per-job progress.
+
+Completed durable job records for managed accounts are removed during local
+account erasure along with their workspace files.
 
 The real limit on a GPU host is VRAM, not CPU: each `main.py` job holds Parakeet
 (onnxruntime CUDA), TransNetV2 (torch, ~2 GB at peak) and an NVENC session. When

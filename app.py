@@ -39,6 +39,7 @@ import remote_worker
 import yt_account
 import api_role as _api_role
 from jsonfile import write_json_atomic
+import job_store
 
 load_dotenv()
 
@@ -60,7 +61,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
 MAX_FILE_SIZE_MB = _positive_int_env("MAX_FILE_SIZE_MB", 4096)
 MAX_CONCURRENT_UPLOADS = _positive_int_env("MAX_CONCURRENT_UPLOADS", 2)
 UPLOAD_CHUNK_SIZE_MB = _positive_int_env("UPLOAD_CHUNK_SIZE_MB", 8)
@@ -981,6 +982,161 @@ concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 _admitting: set = set()
 _recent_job_seconds: list = []
 DEFAULT_JOB_SECONDS = 240
+
+
+def _job_store_path():
+    return os.path.join(OUTPUT_DIR, ".openshorts-jobs.sqlite3")
+
+
+def _durable_job_record(job_id):
+    try:
+        return job_store.get(_job_store_path(), job_id)
+    except Exception as e:
+        print(f"⚠️ Could not read durable job record {job_id}: {e}")
+        return None
+
+
+def _update_job_record(job_id, **changes):
+    try:
+        return job_store.update(_job_store_path(), job_id, **changes)
+    except Exception as e:
+        print(f"⚠️ Could not persist job record {job_id}: {e}")
+        return None
+
+
+def _fail_current_job_stage(job_id, error):
+    record = _durable_job_record(job_id) or {}
+    stage_name = record.get("current_stage")
+    if stage_name and stage_name not in ("queued", "starting", "completed", "failed"):
+        try:
+            job_store.stage(_job_store_path(), job_id, stage_name, "failed", error=error)
+        except Exception as e:
+            print(f"⚠️ Could not persist failed stage for {job_id}: {e}")
+
+
+def _job_progress(record):
+    if not record:
+        return None
+    stages = record.get("completed_stages") or []
+    clips = record.get("clips") or {}
+    total_clips = len(record.get("selected_clip_timestamps") or [])
+    complete_clips = sum(1 for clip in clips.values() if clip.get("status") == "completed")
+    failed_clips = sum(1 for clip in clips.values() if clip.get("status") == "failed")
+    analysis_stages = {
+        "upload", "metadata_extraction", "audio_extraction", "transcription",
+        "gemini_scoring", "gemini_detailed_analysis", "clip_selection",
+    }
+    completed_analysis = len(analysis_stages.intersection(stages))
+    clip_fraction = complete_clips / total_clips if total_clips else 0
+    percent = min(99, int((completed_analysis + 5 * clip_fraction) / 12 * 100))
+    if record.get("status") == "completed":
+        percent = 100
+    return {
+        "current_stage": record.get("current_stage"),
+        "percent": percent,
+        "completed_clips": complete_clips,
+        "pending_clips": max(0, total_clips - complete_clips - failed_clips),
+        "failed_clips": failed_clips,
+        "total_clips": total_clips,
+        "interrupted": bool(record.get("interrupted")),
+        "recovery_message": record.get("recovery_message"),
+        "retryable": (not BILLING_ENABLED and record.get("status") == "failed"
+                      and bool(record.get("source_video_path"))
+                      and os.path.isfile(record.get("source_video_path"))),
+    }
+
+
+_RETRY_ENV_KEYS = frozenset({
+    "PROCESSING_PROFILE", "FAST_PREVIEW", "STATIC_FRAMING", "SCENE_DETECTION",
+    "SCENE_ENGINE", "AUTO_CAPTIONS", "AUTO_HOOK", "AUTO_HOOK_STYLE",
+    "CLIP_TARGET_MIN", "CLIP_TARGET_MAX", "CLIP_MIN_SECONDS",
+    "CLIP_MAX_SECONDS", "SPLIT_LAYOUT", "SCREENCAST_LAYOUT", "SPEAKER_CUT",
+    "PUNCH_IN", "MAX_SOURCE_MINUTES", "SOURCE_START_SECONDS",
+    "SOURCE_CAP_MINUTES", "DOWNLOAD_SKIP_STATICS", "WATERMARK", "CUT_MAX_FPS",
+})
+
+
+def _job_input_path(cmd):
+    start = next((i + 1 for i, arg in enumerate(cmd or [])
+                  if str(arg).endswith("main.py")), 0)
+    for i in range(start, len(cmd or []) - 1):
+        if cmd[i] in ("-i", "--input"):
+            return os.path.realpath(cmd[i + 1])
+    return None
+
+
+def _new_job_record(job_id, job, input_path=None):
+    source_path = input_path or _job_input_path(job.get("cmd"))
+    source_metadata = {"name": os.path.basename(source_path)} if source_path else {}
+    if source_path:
+        try:
+            stat = os.stat(source_path)
+            source_metadata.update(size_bytes=stat.st_size, modified_at=stat.st_mtime)
+        except OSError:
+            pass
+    retry_env = {key: value for key, value in (job.get("env") or {}).items()
+                 if key in _RETRY_ENV_KEYS}
+    try:
+        job_store.create(_job_store_path(), {
+            "job_id": job_id,
+            "owner_id": None if job.get("user_id") is None else str(job.get("user_id")),
+            "status": job.get("status", "queued"),
+            "current_stage": "queued",
+            "source_video_path": source_path,
+            "source_metadata": source_metadata,
+            "output_dir": job.get("output_dir"),
+            "retry_command": job.get("cmd"),
+            "retry_env": retry_env,
+            "processing_started_at": None,
+            "processing_finished_at": None,
+            "error": None,
+        })
+    except Exception as e:
+        print(f"⚠️ Could not create durable job record {job_id}: {e}")
+
+
+def _sync_job_record_from_metadata(job_id, output_dir):
+    try:
+        paths = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not paths:
+            return
+        with open(paths[0], encoding="utf-8") as source:
+            metadata = json.load(source)
+        shorts = metadata.get("shorts") or []
+        video_name = metadata.get("source_video")
+        source_path = (
+            os.path.join(output_dir, video_name)
+            if isinstance(video_name, str) and video_name not in (".", "..")
+            and os.path.basename(video_name) == video_name else None
+        )
+        existing = _durable_job_record(job_id) or {}
+        saved_source = existing.get("source_video_path")
+        if (saved_source and os.path.isfile(saved_source)
+                and (not source_path or not os.path.isfile(source_path))):
+            source_path = saved_source
+        source_metadata = {"duration_seconds": metadata.get("source_duration")}
+        if source_path:
+            try:
+                stat = os.stat(source_path)
+                source_metadata.update(name=os.path.basename(source_path),
+                                       size_bytes=stat.st_size, modified_at=stat.st_mtime)
+            except OSError:
+                pass
+        _update_job_record(
+            job_id,
+            source_video_path=source_path or None,
+            source_metadata=source_metadata,
+            selected_clip_timestamps=[
+                {"start": clip.get("start"), "end": clip.get("end")} for clip in shorts
+            ],
+            gemini_results={
+                "cost_analysis": metadata.get("cost_analysis"),
+                "selected_count": len(shorts),
+                "shorts": shorts,
+            },
+        )
+    except Exception as e:
+        print(f"⚠️ Could not sync metadata into durable job record {job_id}: {e}")
 
 
 def _record_job_duration(seconds):
@@ -1908,17 +2064,44 @@ def _recover_jobs_from_disk():
                     raw = f.read().strip()
                 owner = int(raw) if raw.isdigit() else (raw or None)
             jobs[job_id] = {
-                'status': 'completed',
+                'status': ((_durable_job_record(job_id) or {}).get("status")
+                           if (_durable_job_record(job_id) or {}).get("status") == "failed"
+                           else 'completed'),
                 'logs': _TimedLog(["♻️ Job recovered from disk after server restart."]),
                 'output_dir': job_path,
                 'user_id': owner,
                 'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
             }
+            _update_job_record(
+                job_id, status=jobs[job_id]["status"],
+                recovery_message="Previous job output recovered from workspace storage.")
             recovered += 1
         except Exception as e:
             print(f"⚠️ Could not recover job {job_id}: {e}")
     if recovered:
         print(f"♻️  Recovered {recovered} completed job(s) from disk.")
+
+
+def _reconcile_persistent_job_records():
+    """Make records without a live job or resume manifest explicitly retryable."""
+    try:
+        records = job_store.list_jobs(_job_store_path(), limit=200)
+    except Exception as e:
+        print(f"⚠️ Could not reconcile durable job records: {e}")
+        return
+    for record in records:
+        job_id = record.get("job_id")
+        if (record.get("status") not in ("queued", "processing")
+                or not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id)
+                or job_id in jobs or os.path.isfile(_manifest_path(job_id))):
+            continue
+        message = ("The previous run was interrupted before a recoverable "
+                   "checkpoint was committed. You can retry this job.")
+        _fail_current_job_stage(job_id, message)
+        _update_job_record(
+            job_id, status="failed", current_stage="failed", interrupted=True,
+            recovery_message=message, processing_finished_at=time.time(),
+            error=message)
 
 
 # --- Mid-flight job resume (survive a redeploy without losing work) ----------
@@ -2301,6 +2484,7 @@ async def _resume_scan():
             continue
         try:
             await _resume_interrupted_jobs_async()
+            await asyncio.to_thread(_reconcile_persistent_job_records)
             _fold_slow_lane()
             await _raise_to_owner_plans()
             await _follow_manifest_priorities()
@@ -2590,6 +2774,11 @@ def _register_resumed(picked) -> int:
             'lane': _queue_mode.lane_of_priority(_queue_mode.effective_priority(priority)),
             'submitted_at': float(m["submitted_at"] if m.get("submitted_at") is not None else time.time()),
         }
+        _update_job_record(
+            job_id, status="queued", current_stage="resuming",
+            interrupted=True, recovered_at=time.time(),
+            recovery_message="Processing was interrupted by a server or environment restart. Resuming from saved checkpoints.",
+            processing_finished_at=None)
         if m.get("stage") == _DELIVERY_STAGE:
             # Rendered already, cut during its delivery: finish the delivery
             # (from the first step not done), never run main.py again.
@@ -2610,12 +2799,13 @@ def _register_resumed(picked) -> int:
 def _resume_interrupted_jobs() -> set:
     """Re-enqueue jobs that were mid-processing when the server last stopped.
 
-    Runs after _recover_jobs_from_disk: a job whose clips already finished has a
-    metadata JSON and is recovered as 'completed', so we only resume manifests
-    with no metadata yet (analysis never finished). Also called periodically
-    (_resume_scan, through ``_resume_interrupted_jobs_async``): a manifest
-    another instance is heartbeating is left alone until that heartbeat goes
-    stale, and a job this instance already holds is never enqueued twice.
+    Runs after _recover_jobs_from_disk, which skips any directory that still has
+    a resume manifest. A metadata JSON next to a manifest can contain completed
+    analysis and clips; main.py validates and reuses those checkpoints when the
+    job resumes. Also called periodically (_resume_scan, through
+    ``_resume_interrupted_jobs_async``): a manifest another instance is
+    heartbeating is left alone until that heartbeat goes stale, and a job this
+    instance already holds is never enqueued twice.
 
     Returns the set of reservation ids for every manifest still on disk —
     resumed here or alive on the other instance — so the caller can keep them
@@ -3385,6 +3575,7 @@ async def run_job_wrapper(job_id):
     # still be settled (released) instead of staying held for hours.
     job = jobs.get(job_id)
     interrupted = False
+    skip_delivery = False
     started = time.monotonic()
     try:
         if job:
@@ -3407,22 +3598,25 @@ async def run_job_wrapper(job_id):
             print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
             if interrupted:
                 raise asyncio.CancelledError()
-            return
-        if _should_auto_retry(job):
+            skip_delivery = True
+        elif _should_auto_retry(job):
             _schedule_auto_retry(job_id, job)
             _release_slot(job_id)
             print(f"🔁 Released slot for job {job_id} (auto-retry scheduled).")
-            return
-        # The subprocess returned (success or genuine failure): a terminal
-        # state. What is left (settle, R2 archive, unmark, webhook, emails) is
-        # network I/O that never touches the card, so the GPU slot goes to the
-        # next job now and the delivery runs outside it. The job enters the
-        # delivery stage (manifest stamped, ``_delivering_jobs``) BEFORE it
-        # leaves ``_running_jobs``: a drain or a scan never sees it in neither.
-        if job is not None:
-            _begin_delivery(job_id, job)
-        _release_slot(job_id)
-        print(f"✅ Released slot for job: {job_id}")
+            skip_delivery = True
+        else:
+            # The subprocess returned (success or genuine failure): a terminal
+            # state. What is left (settle, R2 archive, unmark, webhook, emails) is
+            # network I/O that never touches the card, so the GPU slot goes to the
+            # next job now and the delivery runs outside it. The job enters the
+            # delivery stage (manifest stamped, ``_delivering_jobs``) BEFORE it
+            # leaves ``_running_jobs``: a drain or a scan never sees it in neither.
+            if job is not None:
+                _begin_delivery(job_id, job)
+            _release_slot(job_id)
+            print(f"✅ Released slot for job: {job_id}")
+    if skip_delivery:
+        return
     if job is not None:
         await _deliver_job(job_id, job)
     else:
@@ -4162,6 +4356,10 @@ def _purge_local_jobs_for_user(user_id) -> int:
     """
     uid = str(user_id)
     removed = 0
+    try:
+        job_store.delete_owner(_job_store_path(), uid)
+    except Exception as e:
+        print(f"⚠️ Could not erase durable local job records for {uid}: {e}")
 
     job_ids = {jid for jid, job in list(jobs.items()) if _owned_by(job, uid)}
     thumbs_dir_name = os.path.basename(THUMBNAILS_DIR)
@@ -4353,6 +4551,7 @@ async def lifespan(app: FastAPI):
         _resumed_reservation_ids = _manifest_reservation_ids()
     else:
         _resumed_reservation_ids = _resume_interrupted_jobs()
+        _reconcile_persistent_job_records()
         # Deploy handover: claim the marker (any older instance sees it and
         # drains), keep watching it in case a newer one appears, keep looking
         # for manifests left behind, and drain instead of dying on docker stop.
@@ -4897,6 +5096,36 @@ def _handle_job_line(job_id, line, remote=False):
     decoded_line = _scrub_secrets(line.strip())
     if not decoded_line:
         return
+    if decoded_line == "JOB_METADATA_READY":
+        _sync_job_record_from_metadata(
+            job_id, (jobs.get(job_id) or {}).get("output_dir", ""))
+        return
+    if decoded_line.startswith("JOB_STAGE "):
+        try:
+            _, stage_name, state = decoded_line.split(" ", 2)
+            if stage_name.replace("_", "").isalnum() and state in ("started", "completed", "failed"):
+                job_store.stage(_job_store_path(), job_id, stage_name, state)
+                if job_id in jobs:
+                    jobs[job_id]["current_stage"] = stage_name
+                if state == "completed" and stage_name in (
+                        "gemini_detailed_analysis", "clip_selection"):
+                    _sync_job_record_from_metadata(
+                        job_id, (jobs.get(job_id) or {}).get("output_dir", ""))
+        except Exception as e:
+            print(f"⚠️ Could not persist stage checkpoint for {job_id}: {e}")
+        return
+    if decoded_line.startswith("JOB_CLIP "):
+        try:
+            parts = decoded_line.split(" ", 3)
+            _, raw_index, state = parts[:3]
+            index = int(raw_index)
+            filename = parts[3] if len(parts) == 4 else None
+            if state not in ("pending", "processing", "completed", "failed"):
+                return
+            job_store.clip(_job_store_path(), job_id, index, state, filename=filename)
+        except (ValueError, OSError) as e:
+            print(f"⚠️ Could not persist clip checkpoint for {job_id}: {e}")
+        return
     # Internal marker: a clip finished its whole chain and this is the file to
     # serve for it. Consumed here like PROXY_BYTES so it never reaches the
     # user's log.
@@ -4912,6 +5141,9 @@ def _handle_job_line(job_id, line, remote=False):
                 plain = watermarked.is_marked(filename)
             if job_id in jobs and plain:
                 jobs[job_id].setdefault('ready_files', {})[int(index)] = filename
+            if plain:
+                job_store.clip(_job_store_path(), job_id, int(index), "completed",
+                               filename=filename)
         except ValueError:
             pass
         return
@@ -5089,6 +5321,10 @@ def _finish_job(job_id, returncode, output_dir):
     and result, from the exit code and what is on disk."""
     if returncode == 0:
         jobs[job_id]['status'] = 'completed'
+        jobs[job_id]["processing_finished_at"] = time.time()
+        _update_job_record(job_id, status="completed", current_stage="completed",
+                           processing_finished_at=time.time(), interrupted=False,
+                           recovery_message=None, error=None)
         jobs[job_id]['logs'].append("Process finished successfully.")
 
         # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
@@ -5119,6 +5355,12 @@ def _finish_job(job_id, returncode, output_dir):
                 # Nothing to hand over: fail the job so _settle_reservation
                 # releases the minutes instead of committing them.
                 jobs[job_id]['status'] = 'failed'
+                _fail_current_job_stage(
+                    job_id, "No clips could be rendered from this video.")
+                _update_job_record(
+                    job_id, status="failed", current_stage="failed",
+                    processing_finished_at=time.time(),
+                    error="No clips could be rendered from this video.")
                 jobs[job_id]['logs'].append(
                     "No clips could be rendered from this video.")
             else:
@@ -5128,10 +5370,18 @@ def _finish_job(job_id, returncode, output_dir):
                 jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
         else:
             jobs[job_id]['status'] = 'failed'
+            _fail_current_job_stage(job_id, "No metadata file generated.")
+            _update_job_record(job_id, status="failed", current_stage="failed",
+                               processing_finished_at=time.time(),
+                               error="No metadata file generated.")
             jobs[job_id]['logs'].append("No metadata file generated.")
     else:
         jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+        error = _scrub_secrets(f"Process failed with exit code {returncode}")
+        _fail_current_job_stage(job_id, error)
+        _update_job_record(job_id, status="failed", current_stage="failed",
+                           processing_finished_at=time.time(), error=error)
+        jobs[job_id]['logs'].append(error)
 
 
 async def _run_main(job_id, cmd, env, tick=None):
@@ -5196,6 +5446,9 @@ async def run_job(job_id, job_data):
     output_dir = job_data['output_dir']
 
     jobs[job_id]['status'] = 'processing'
+    jobs[job_id]["processing_started_at"] = time.time()
+    _update_job_record(job_id, status="processing", current_stage="starting",
+                       processing_started_at=time.time(), interrupted=False)
     jobs[job_id]['logs'].append("Job started by worker.")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
 
@@ -6728,6 +6981,12 @@ async def process_endpoint(
         except Exception as e:
             print(f"⚠️ Could not persist job owner for {job_id}: {e}")
 
+    _new_job_record(job_id, jobs[job_id], input_path=input_path)
+    try:
+        job_store.stage(_job_store_path(), job_id, "upload", "completed")
+    except Exception as e:
+        print(f"⚠️ Could not checkpoint upload for {job_id}: {e}")
+
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
@@ -6853,17 +7112,20 @@ def _status_signature(job_id, job):
     return (_presented_status(job_id, job), len(job.get('logs') or ()),
             len(clips) if isinstance(clips, list) else -1,
             json.dumps(job.get('partial'), sort_keys=True, default=str),
-            str(job.get('user_id')))
+            str(job.get('user_id')),
+            json.dumps(_job_progress(_durable_job_record(job_id)), sort_keys=True))
 
 
 def _status_snapshot(job_id, job):
     lines, times = _visible_logs_timed(job['logs'])
     owner = job.get('user_id')
+    record = _durable_job_record(job_id)
     return {"instance": INSTANCE_ID,
             "owner": None if owner is None else str(owner),
             "status": _presented_status(job_id, job),
             "logs": lines, "log_times": times,
-            "result": job.get('result'), "partial": job.get('partial')}
+            "result": job.get('result'), "partial": job.get('partial'),
+            "progress": _job_progress(record)}
 
 
 def _write_status_files(writes, removes, queue_view):
@@ -6991,6 +7253,7 @@ async def _status_from_snapshot(request, snap, queue):
         "result": _with_download_urls(snap.get("result")),
         "queue": queue if status == 'queued' else None,
         "partial": snap.get("partial"),
+        "progress": snap.get("progress"),
     }
 
 
@@ -7007,6 +7270,7 @@ async def get_status(job_id: str, request: Request):
 
     await _assert_job_owner(request, job)
     _logs_view = _visible_logs_timed(job['logs'])
+    record = _durable_job_record(job_id)
     return {
         "status": _presented_status(job_id, job),
         "logs": _logs_view[0],
@@ -7018,7 +7282,92 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+        "progress": _job_progress(record),
     }
+
+
+@app.get("/api/jobs")
+async def list_persistent_jobs(request: Request, limit: int = 50):
+    user_id = await _owner_id(request)
+    if BILLING_ENABLED and user_id is None:
+        raise HTTPException(status_code=401, detail="Sign in to view job history")
+    try:
+        records = job_store.list_jobs(_job_store_path(), limit=limit)
+    except Exception as e:
+        print(f"⚠️ Could not read durable job history: {e}")
+        raise HTTPException(status_code=503, detail="Job history is temporarily unavailable")
+    if BILLING_ENABLED:
+        records = [record for record in records
+                   if str(record.get("owner_id")) == str(user_id)]
+    return {"jobs": [{
+        "job_id": record.get("job_id"),
+        "status": record.get("status"),
+        "current_stage": record.get("current_stage"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "source_metadata": record.get("source_metadata") or {},
+        "progress": _job_progress(record),
+        "error": record.get("error"),
+        "interrupted": bool(record.get("interrupted")),
+        "retryable": (not BILLING_ENABLED and record.get("status") == "failed"
+                      and bool(record.get("source_video_path"))
+                      and os.path.isfile(record.get("source_video_path"))),
+    } for record in records]}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_persistent_job(job_id: str, request: Request):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="Manual retry is available for self-hosted jobs")
+    record = _durable_job_record(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, {"user_id": record.get("owner_id")})
+    if record.get("status") not in ("failed", "interrupted"):
+        raise HTTPException(status_code=409, detail="Only failed or interrupted jobs can be retried")
+    source_path = record.get("source_video_path")
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(status_code=409, detail="The saved source video is no longer available")
+    cmd = record.get("retry_command")
+    if not isinstance(cmd, list) or not cmd:
+        raise HTTPException(status_code=409, detail="This job has no saved retry command")
+    input_path = _job_input_path(cmd)
+    if not input_path or not os.path.isfile(input_path):
+        raise HTTPException(status_code=409, detail="The saved job input is no longer available")
+    if job_id in _running_jobs or (jobs.get(job_id) or {}).get("status") in ("queued", "processing"):
+        raise HTTPException(status_code=409, detail="This job is already active")
+    api_key = await resolve_gemini(request)
+    if not api_key:
+        raise gemini_missing_error()
+
+    job_path = os.path.join(OUTPUT_DIR, job_id)
+    env = child_env()
+    env.update(record.get("retry_env") or {})
+    env["GEMINI_API_KEY"] = api_key
+    job = {
+        "status": "queued",
+        "logs": _TimedLog(["Retrying from the last saved checkpoint."]),
+        "cmd": cmd,
+        "env": env,
+        "output_dir": job_path,
+        "user_id": None,
+        "reservation_id": None,
+        "watermark": env.get("WATERMARK") == "1",
+        "partial": None,
+        "lane": _queue_mode.NORMAL,
+        "submitted_at": _arrival_now(),
+        "ready_files": {},
+    }
+    jobs[job_id] = job
+    _update_job_record(job_id, status="queued", current_stage="resuming",
+                       interrupted=False, error=None, processing_finished_at=None,
+                       failed_stages=[])
+    _write_resume_manifest(
+        job_id, cmd, _queue_mode.FREE_PRIORITY, None, None,
+        watermark=job["watermark"], lane=job["lane"],
+        submitted_at=job["submitted_at"])
+    _enqueue_job(job_id, _queue_mode.FREE_PRIORITY)
+    return {"job_id": job_id, "status": "queued", "resumed": True}
 
 
 def _locate_source(job_id: str):
