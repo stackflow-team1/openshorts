@@ -8,6 +8,8 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
     restart: unless-stopped
 
   frontend:
