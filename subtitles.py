@@ -17,11 +17,20 @@ DEFAULT_WHISPER_MODEL = "small"
 
 
 def get_whisper_config():
-    """Return the faster-whisper model config, overridable via env vars."""
+    """Return the profile-aware faster-whisper model config."""
+    profile = os.environ.get("PROCESSING_PROFILE", "QUALITY").strip().upper()
+    if profile not in ("QUALITY", "BALANCED", "FAST"):
+        profile = "QUALITY"
+    defaults = {"QUALITY": DEFAULT_WHISPER_MODEL, "BALANCED": "base", "FAST": "tiny"}
+    model_size = (os.environ.get(f"WHISPER_MODEL_{profile}")
+                  or os.environ.get("WHISPER_MODEL")
+                  or defaults[profile])
+    device = os.environ.get("WHISPER_DEVICE", "cpu").strip().lower()
     return {
-        "model_size": os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
-        "device": os.environ.get("WHISPER_DEVICE", "cpu"),
-        "compute_type": os.environ.get("WHISPER_COMPUTE", "int8"),
+        "model_size": model_size,
+        "device": device,
+        "compute_type": ("int8" if device == "cpu"
+                         else os.environ.get("WHISPER_COMPUTE", "int8")),
     }
 
 

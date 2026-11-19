@@ -229,7 +229,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
             {!canPost && (
                 <div className="mb-4 p-3 bg-warn/10 text-warn text-xs rounded-input flex items-start gap-2">
                     <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                    <div>Set your Upload-Post API key in Settings first.</div>
+                    <div>Upload-Post is optional and only needed to publish. Configure it in Settings to schedule these clips.</div>
                 </div>
             )}
 

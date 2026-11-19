@@ -14,9 +14,9 @@ and title are rewritten to name what is shown. Same principle as the layout
 picker: a few frames at a legible resolution answering one concrete
 question. About 3k tokens per clip.
 
-Frames need a model that can see, so this is Gemini-only: with just a local
-LLM (``LLM_BASE_URL``) the function returns None and the transcript-based
-hook stands. Never raises: a hook problem must never cost the clip.
+Frames need a model that can see, so this is Gemini-only: without a Gemini key
+the function returns None and the transcript-based hook stands. Never raises:
+a hook problem must never cost the clip.
 """
 from __future__ import annotations
 

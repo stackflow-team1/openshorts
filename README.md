@@ -32,15 +32,15 @@ Two people on camera? OpenShorts stacks them instead of shrinking the wide shot,
 |---|---|---|
 | **Price** | Free forever, MIT | Free plan, paid from $12/mo |
 | **Speed** | 5 to 8 min per 8-min video on CPU | About 50s on our NVIDIA GPU |
-| **API keys** | Bring your own Gemini, ElevenLabs, fal.ai | Gemini included, nothing to set up |
+| **API keys** | Gemini for clip generation; Upload-Post optional for social publishing | Gemini included, nothing to set up |
 | **Watermark / limits** | None, ever | Watermark and 20 min/mo on the free plan, neither on paid |
 | **Auto-posting** | With your own Upload-Post account | Paid plans: connect TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads and Bluesky once, post or schedule from the app |
 | **Autopilot** | Not included | Paid plans: every new video on your channel becomes scheduled shorts |
-| **Setup** | Docker, 8GB+ RAM, model downloads | Sign in and paste a link |
+| **Setup** | Docker, 8GB+ RAM | Sign in and paste a link |
 | **MCP / API for agents** | Same `/mcp` endpoint, but only while your machine is on | Always-on endpoint at [mcp.openshorts.app](https://www.openshorts.app/mcp), API keys in one click |
 | **Your data** | Your server | Ours |
 
-Self-hosting is genuinely free and always will be. It costs you a machine, your own API keys and the time to keep it running. The hosted plans exist to cover that hardware and those keys.
+Self-hosting is genuinely free and always will be. You provide the machine, a Gemini API key for analysis, and the time to keep it running. Upload-Post, fal.ai, ElevenLabs and AWS S3 are optional integrations, not requirements for the Clip Generator.
 
 **Compared to Opus Clip, Klap, Vizard** (public pricing pages, checked October 2026; full breakdown at [openshorts.app/alternatives](https://www.openshorts.app/alternatives)):
 
@@ -97,8 +97,7 @@ Add OpenShorts to Claude or ChatGPT with one URL and ask for clips in plain lang
 ## Key Features
 
 ### Clip Generator
-- **Viral Moment Detection**: Google Gemini 3.1 Flash-Lite ranks the transcript and scene boundaries to pick 3-15 moments of 15-60 seconds, each with a virality score
-- **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
+- **Viral Moment Detection**: Google Gemini ranks the transcript and scene boundaries to pick 3-15 moments of 15-60 seconds, each with a virality score
 - **Smart 9:16 Reframing**: per scene: TRACK (MediaPipe + YOLOv8 face tracking), GENERAL (blurred background), SPLIT (two speakers stacked, captions on the seam) and SCREENCAST (screen over presenter); the layout is picked per video by Gemini or forced from the dashboard
 - **Captions**: faster-whisper (or Parakeet on GPU) with word-level timestamps, several caption styles, burned into the clip
 - **Clip editor**: word-level cuts, extra segments, framing changes and fast re-renders
@@ -174,24 +173,22 @@ Videos generated with OpenShorts AI Shorts — no camera, no studio, no actors:
 | **Social auto-publishing** | Yes | Pro only | TikTok only | Paid only | Paid only | No |
 | **Schedule uploads** | Yes | Pro only | No | Paid only | Paid only | No |
 | **Data privacy** | **Your server** | Their cloud | Their cloud | Their cloud | Their cloud | Their cloud |
-| **Works with a local LLM (Ollama)** | **Yes** | No | No | No | No | No |
 
 ---
 
 ## How Much Does It Cost?
 
-Self-hosting OpenShorts is free. You provide the machine and you only pay for the AI APIs you use, and most have generous free tiers:
+Self-hosting OpenShorts is free. The Clip Generator uses Google Gemini for AI analysis; its transcription, video processing and rendering run locally. These optional services are used only by the features listed:
 
 | Service | Free Tier | Paid Cost | Used For |
 |---------|-----------|-----------|----------|
 | **Google Gemini** | Free trial with generous limits | < $0.01 per 10-min video | Viral moment detection, script generation, web research |
-| **Local LLM (Ollama, LM Studio, vLLM...)** | **Free, your hardware** | $0 | Viral moment detection instead of Gemini (`LLM_BASE_URL`) |
 | **fal.ai** | Pay-per-use | ~$0.50-1.50 per AI Short | Actor generation, talking head video, lip-sync |
 | **ElevenLabs** | Free tier available | Pay-per-use | Voiceover, voice dubbing |
 | **Upload-Post** | **10 free uploads/month** to all networks (no credit card) | Pay-per-use | Auto-publishing to TikTok, Instagram, YouTube |
 | **AWS S3** | Optional | ~$0.023/GB | Cloud backup for clips and gallery |
 
-**Bottom line:** You can clip videos for practically free with Gemini, and publish 10 videos/month to all social networks at zero cost with Upload-Post.
+**Bottom line:** Faster-Whisper, FFmpeg and Remotion run locally. Gemini is required for analysis; Upload-Post and the other listed services are optional and are not needed to generate or download clips.
 
 **Don't want to run any of that?** [openshorts.app](https://www.openshorts.app/) is the same software on our hardware: our NVIDIA GPU clips an 8-minute video in about 50 seconds instead of the 5 to 8 minutes it takes on a typical CPU, the Gemini key is included, and paid plans add auto-posting and Autopilot with nothing to set up. The free plan clips your first video whole up to 60 minutes, then 20 minutes a month, with a watermark and no credit card; paid plans start at $12/mo for 100 minutes without watermark.
 
@@ -200,10 +197,9 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 ## Requirements
 
 - **Docker & Docker Compose**
-- **Google Gemini API Key** ([Free — get it here](https://aistudio.google.com/app/apikey)) — required for all AI features
-- **fal.ai API Key** ([Pay-per-use](https://fal.ai)) — required for AI Shorts (actor generation, video, lip-sync)
-- **ElevenLabs API Key** ([Free tier](https://elevenlabs.io)) — required for voiceover/dubbing
-- **Upload-Post API Key** ([free tier](https://upload-post.com)) — required for direct social posting
+- **Google Gemini API Key** — required for clip analysis, selection, scoring and visual analysis
+- **Upload-Post API Key** (optional) — publishing clips to social networks
+- **fal.ai**, **ElevenLabs**, and **AWS S3** (optional) — advanced AI Shorts/dubbing and backup features; not needed by the Clip Generator
 
 ---
 
@@ -215,10 +211,11 @@ git clone https://github.com/mutonby/openshorts.git
 cd openshorts
 ```
 
-### 2. Configure (optional)
+### 2. Configure
 ```bash
 cp .env.example .env
-# Edit .env with your AWS keys for S3 backup
+# You may set GEMINI_API_KEY in .env or enter it in Dashboard → Settings.
+# AWS credentials are only needed if you choose S3 backup.
 ```
 
 ### 3. Launch
@@ -229,12 +226,10 @@ docker compose up --build
 ### 4. Open Dashboard
 Navigate to **`http://localhost:5175`**
 
-1. Go to **Settings** and enter your API keys (Gemini, fal.ai, ElevenLabs, Upload-Post)
-2. **Clip Generator**: Upload a long-form video to generate viral shorts
-3. **AI Shorts**: Describe your product or paste a URL to generate UGC marketing videos
-4. **YouTube Studio**: Generate thumbnails, titles, and descriptions for YouTube
-5. **UGC Gallery**: Browse all generated videos and avatars
-6. **AI Agent**: Drop vertical videos in a folder and an agent skill picks, edits and queues clips for your approval
+1. **Settings**: Enter your Gemini API key.
+2. **Clip Generator**: Upload a long-form video; MP4s are saved under `output/<job-id>/` and can be downloaded from the results.
+3. **Social Integration**: Add Upload-Post only if you want to publish clips directly to social networks.
+4. AI Shorts, dubbing, and S3 backup are separate optional integrations.
 
 ### 5. GPU acceleration (optional, NVIDIA)
 
@@ -282,44 +277,13 @@ docker exec openshorts-backend ffmpeg -hide_banner -f lavfi -i testsrc=size=256x
 ```
 The backend log on the first job reports the chosen encoder and transcription device. A CUDA error in whisper (e.g. VRAM exhausted) retries once on CPU automatically. 8 GB of VRAM is enough for `large-v3-turbo` fp16 plus the detection models.
 
----
-
-### 6. Run without a Google key (local LLM, optional)
-
-The only cloud call in the clip pipeline is the moment picker: it sends the
-transcript (never the video) to Gemini. Point it at any OpenAI-compatible
-server instead and the whole pipeline stays on your box:
-
-```bash
-# .env
-LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
-LLM_MODEL=qwen2.5:14b                                # any chat model that follows instructions
-# LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
-```
-
-Works with Ollama, LM Studio, vLLM, llama.cpp server, LocalAI and OpenRouter.
-The dashboard stops asking for a Gemini key when this is set. Two things to
-know:
-
-- **Context length.** A scoring call carries three transcript windows
-  (~2-3k tokens) and the detail call up to ten (~5k on a long podcast).
-  Ollama defaults to a 4096-token context and truncates silently, so run it
-  with `OLLAMA_CONTEXT_LENGTH=16384` (or set `num_ctx` in a Modelfile); raise
-  `LLM_SCORE_BATCH` above 3 only if your context allows it. 7-8B models
-  return valid JSON reliably, 3B ones do not.
-- **What still needs Gemini.** Anything that has to look at frames: the
-  automatic layout picker (`AUTO_LAYOUT`), the on-screen content detector
-  and silent videos (no speech to clip by). Without a Gemini key those fall
-  back to the plain face-tracking crop, and a silent video fails with a
-  message that says so. Add a key alongside `LLM_BASE_URL` and you get both.
-
 ## Technical Pipeline
 
 ### Clip Generator
 1. **Ingest** — YouTube URL (yt-dlp) or local upload
 2. **Transcribe** — faster-whisper (or Parakeet on GPU) with word-level timestamps
 3. **Detect** — PySceneDetect for scene boundaries
-4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each)
+4. **Analyze** — Gemini identifies and scores 3-15 viral moments (15-60s each)
 5. **Extract** — FFmpeg precise clip cutting
 6. **Reframe** — AI vertical cropping with subject tracking
 7. **Effects** — Subtitles, hooks, AI video effects
@@ -448,18 +412,14 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `AWS_S3_BUCKET` | Private bucket for clip backup |
 | `AWS_S3_PUBLIC_BUCKET` | Public bucket for gallery/avatars |
 | `MAX_CONCURRENT_JOBS` | Concurrent processing limit (default: 5) |
-| `LLM_BASE_URL` | OpenAI-compatible server for the moment picker (Ollama, vLLM, LM Studio...). Set it and the Gemini key becomes optional |
-| `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
-| `LLM_API_KEY` | Bearer token for that server, if it checks one |
-| `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |
 |-----|------------|
-| `GEMINI_API_KEY` | Google Gemini — required unless `LLM_BASE_URL` is set (then only for layout picking and silent videos) |
-| `FAL_KEY` | fal.ai — required for AI Shorts |
-| `ELEVENLABS_API_KEY` | ElevenLabs — required for voiceover/dubbing |
-| `UPLOAD_POST_API_KEY` | Upload-Post — required, for social posting |
+| `GEMINI_API_KEY` | Google Gemini — required for Clip Generator analysis; enter in Settings or configure on the server |
+| `FAL_KEY` | fal.ai — optional, for AI Shorts |
+| `ELEVENLABS_API_KEY` | ElevenLabs — optional, for voiceover/dubbing |
+| `UPLOAD_POST_API_KEY` | Upload-Post — optional, for social posting |
 
 ---
 

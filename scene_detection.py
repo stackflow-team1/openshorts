@@ -29,6 +29,7 @@ from scenedetect import open_video, SceneManager, FrameTimecode
 from scenedetect.detectors import ContentDetector
 
 import gpu_decode
+from stage_timing import timed_stage
 
 # TransNetV2 input size (width x height), fixed by the trained model.
 _TN2_W, _TN2_H = 48, 27
@@ -37,20 +38,60 @@ _TN2_W, _TN2_H = 48, 27
 # inference is serialized like the other detectors in main.py.
 _TN2_LOCK = threading.Lock()
 _tn2_model = None
+_SCENE_CACHE_LOCK = threading.Lock()
+_SCENE_CACHE = {}
+
+
+def _scene_cache_key(video_path):
+    stat = os.stat(video_path)
+    return (
+        os.path.abspath(video_path), stat.st_size, stat.st_mtime_ns,
+        os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower(),
+        os.environ.get("SCENE_MIN_SEC", "0.4"),
+        os.environ.get("TRANSNETV2_THRESHOLD", "0.5"),
+        os.environ.get("TRANSNETV2_DEVICE", "auto"),
+        os.environ.get("SCENE_DETECTION", "1"),
+    )
 
 
 def detect_scenes(video_path):
     """Detect scenes. Returns (scene_list, fps) where scene_list is a list of
     (FrameTimecode, FrameTimecode) pairs — the same contract PySceneDetect's
     SceneManager.get_scene_list() has always given callers."""
-    engine = os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower()
-    if engine != "pyscenedetect":
-        try:
-            return _detect_transnetv2(video_path)
-        except Exception as e:
-            print(f"   ⚠️ TransNetV2 scene detection failed "
-                  f"({type(e).__name__}: {e}) — falling back to PySceneDetect")
-    return _detect_pyscenedetect(video_path)
+    key = _scene_cache_key(video_path)
+    with _SCENE_CACHE_LOCK:
+        cached = _SCENE_CACHE.get(key)
+    if cached is not None:
+        print("   ♻️ Reusing cached scene analysis.")
+        return list(cached[0]), cached[1]
+
+    with timed_stage("scene_detection"):
+        if os.environ.get("SCENE_DETECTION", "1").strip().lower() in ("0", "false", "off"):
+            cap = cv2.VideoCapture(video_path)
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            finally:
+                cap.release()
+            if frame_count <= 0:
+                raise RuntimeError("Cannot disable scene detection: video has no readable frames")
+            result = ([(FrameTimecode(0, fps), FrameTimecode(frame_count, fps))], fps)
+        else:
+            engine = os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower()
+            if engine != "pyscenedetect":
+                try:
+                    result = _detect_transnetv2(video_path)
+                except Exception as e:
+                    print(f"   ⚠️ TransNetV2 scene detection failed "
+                          f"({type(e).__name__}: {e}) — falling back to PySceneDetect")
+                    result = _detect_pyscenedetect(video_path)
+            else:
+                result = _detect_pyscenedetect(video_path)
+    with _SCENE_CACHE_LOCK:
+        _SCENE_CACHE[key] = result
+        if len(_SCENE_CACHE) > 64:
+            _SCENE_CACHE.pop(next(iter(_SCENE_CACHE)))
+    return list(result[0]), result[1]
 
 
 # --- legacy engine ----------------------------------------------------------

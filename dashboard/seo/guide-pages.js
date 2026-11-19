@@ -89,11 +89,11 @@ const SELF_FAQ = [
   },
   {
     q: 'Which API keys do I need?',
-    a: 'Only a Google Gemini key for the AI features, and its free tier covers individual use. You can replace it with a local LLM through LLM_BASE_URL. ElevenLabs (dubbing), fal.ai (AI Shorts) and Upload-Post (auto-posting) are optional and only needed for those features.',
+    a: 'A Google Gemini key is required for clip analysis and selection; its free tier covers individual use. ElevenLabs (dubbing), fal.ai (AI Shorts), Upload-Post (social publishing) and AWS S3 (backup) are optional and only needed for those features.',
   },
   {
     q: 'Does my video leave my machine?',
-    a: 'The video file stays local: transcription, scene detection, reframing and encoding run on your machine. With Gemini, the moment picker receives the transcript text, the automatic layout picker receives a few still frames, and videos with no speech are sent to Gemini to be clipped by what is on screen. With a local LLM and no Gemini key, nothing leaves the machine at all.',
+    a: 'The video file stays local: transcription, scene detection, reframing and encoding run on your machine. Gemini receives transcript text for moment selection, a few still frames for layout analysis, and frames from videos with no speech for visual clip selection.',
   },
   {
     q: 'Is there an open source AI clipping API?',
@@ -139,7 +139,7 @@ const selfHosted = () => {
     },
     tldr: [
       'OpenShorts is an open source AI clip maker you can self-host: MIT-licensed, started with one <code>docker compose up</code>, and running the same pipeline as the hosted service. It finds the strongest moments in a long video, reframes them to 9:16 with face tracking and burns in word-level subtitles.',
-      'You need Docker, 8 GB+ of RAM and a Google Gemini key (free tier, or a local LLM instead). An optional NVIDIA GPU cuts an 8-minute video from 5 to 8 minutes of processing to about one.',
+      'You need Docker, 8 GB+ of RAM and a Google Gemini key (the free tier is available for individual use). An optional NVIDIA GPU cuts an 8-minute video from 5 to 8 minutes of processing to about one.',
       `Self-hosted has no watermark, no cap and no per-minute meter. The hosted edition, OpenShorts Cloud, exists for people who would rather not run it: free plan with a watermark, paid from ${money(STARTER.monthly)}/month.`,
     ],
     facts: [
@@ -171,7 +171,7 @@ detail is in <a href="/how-openshorts-works">how OpenShorts works</a>.</p>
 <ul>
 <li><strong>Docker and Docker Compose.</strong> Linux, macOS, or Windows with Docker Desktop on the WSL2 backend.</li>
 <li><strong>8 GB of RAM or more</strong> and a modern multi-core CPU. The first start downloads the transcription and detection models.</li>
-<li><strong>A Google Gemini API key</strong> for the AI features. The free tier is enough for individual use, or you can point the moment picker at a local LLM instead.</li>
+<li><strong>A Google Gemini API key</strong> for clip analysis, selection, scoring and visual analysis. The free tier is available for individual use.</li>
 <li><strong>Optional: an NVIDIA GPU with NVENC</strong> (an RTX 4060 class card is plenty). 8 GB of VRAM fits the large-v3-turbo transcription model in fp16 plus the detection models. The GPU build adds about 2 GB to the image.</li>
 </ul>
 <p>The default image is CPU-only, and that is a perfectly good way to start. On a
@@ -220,20 +220,18 @@ has the verification commands.</p>
 <table>
 <thead><tr><th>Key</th><th>Needed for</th><th>Cost</th></tr></thead>
 <tbody>
-<tr><td class="os">Google Gemini</td><td>Picking the moments, titles, the layout picker</td><td>Free tier for individual use; under a cent per 10-minute video on paid tiers</td></tr>
-<tr><td class="os">Local LLM (optional)</td><td>Replaces Gemini for moment picking: Ollama, LM Studio, vLLM, llama.cpp</td><td>$0, your hardware</td></tr>
+<tr><td class="os">Google Gemini</td><td>Picking and scoring moments, titles, visual and layout analysis</td><td>Free tier for individual use; under a cent per 10-minute video on paid tiers</td></tr>
 <tr><td class="os">ElevenLabs (optional)</td><td>Dubbing into 30+ languages, voice-over</td><td>Billed by ElevenLabs; free tier available</td></tr>
 <tr><td class="os">fal.ai (optional)</td><td>AI Shorts: AI actors, lip-sync, B-roll</td><td>Pay per video, billed by fal.ai</td></tr>
 <tr><td class="os">Upload-Post (optional)</td><td>Posting to TikTok, Instagram and YouTube</td><td>Free tier available</td></tr>
 </tbody>
 </table>
-<p>To run without any Google key, set <code>LLM_BASE_URL</code> and
-<code>LLM_MODEL</code> in <code>.env</code> to any OpenAI-compatible server. Give
-it a context of 16k tokens (Ollama defaults to 4k and truncates silently) and a
-7-8B model or larger; 3B models do not return valid JSON reliably. Without
-Gemini, the features that need to look at frames fall back: the automatic layout
-picker uses the plain face-tracking crop, and a video with no speech cannot be
-clipped.</p>
+<p>Enter your Gemini API key in Dashboard Settings or configure
+<code>GEMINI_API_KEY</code> on the server. Gemini selects and scores clips from
+the transcript and analyzes frames for layout and silent-video selection.
+Faster-Whisper, FFmpeg, face tracking, subtitles and Remotion rendering remain
+local. The Clip Generator does not require the optional publishing, dubbing,
+AI Shorts or backup integrations.</p>
 
 <h2>Privacy: what leaves your machine</h2>
 <p>The video file stays where it is. Downloading, transcription, scene detection,
@@ -241,7 +239,6 @@ face tracking, reframing and encoding all run locally, and the clips are written
 to your disk. What goes out depends on the keys you configure:</p>
 <ul>
 <li><strong>With Gemini:</strong> the moment picker sends the transcript text, never the video. The automatic layout picker sends a handful of still frames. A video with no speech (gameplay, B-roll) is sent to Gemini so it can be clipped by what is on screen.</li>
-<li><strong>With a local LLM and no Gemini key:</strong> nothing leaves the machine.</li>
 <li><strong>Optional features</strong> call their providers only when you use them: dubbing sends audio to ElevenLabs, AI Shorts sends prompts to fal.ai, posting sends the finished clip to Upload-Post.</li>
 </ul>
 <p>That is the real reason teams self-host a clipper: unreleased episodes, client
@@ -444,7 +441,7 @@ const freeCompared = () => {
     resolution: 'Same as your source',
     watermark: 'No',
     card: 'No (no account at all)',
-    limits: 'Needs Docker and your own Gemini key or a local LLM',
+    limits: 'Needs Docker and your own Gemini key',
     paid: 'Free, MIT',
     checked: OS.checked,
     link: '/self-hosted-ai-clip-maker',

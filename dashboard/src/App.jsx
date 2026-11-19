@@ -287,7 +287,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm, loading: authLoading } = useAuth();
+  const { billingEnabled, geminiConfigured, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, loading: authLoading } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   // Free plan: "want the watermark off?" once per job, when the clips land.
@@ -1015,12 +1015,9 @@ function App() {
     }
   };
 
-  // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
-  // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  // A self-hosted server running the moment picker on a local LLM
-  // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
-  const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  // Upload-Post is needed only for publishing, never for clip generation.
+  const geminiOk = !!apiKey || geminiConfigured;
+  const processingModelMissing = !billingEnabled && !geminiOk;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -1251,7 +1248,7 @@ function App() {
       // fall through the same gates.
       if (!isSignedIn) { stashPendingJob(data); setShowLogin(true); return; }
       if (!isManaged) { window.location.hash = '#/pricing'; return; }
-    } else if (keysMissing) {
+    } else if (processingModelMissing) {
       setShowKeyModal(true);
       return;
     }
@@ -1264,7 +1261,10 @@ function App() {
     setResults(null);
     // Studio handovers have no local media object; the preview switches to the
     // backend-served source once the job id is known.
-    setProcessingMedia(data.type === 'thumbnail_session' ? null : data);
+    setProcessingMedia(
+      data.type === 'thumbnail_session' || data.type === 'resumable_upload'
+        ? null
+        : data);
     setQualityGate(null);
     setProjectState(null);
     setNoSource(false);
@@ -1280,6 +1280,9 @@ function App() {
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
       const advanced = {
+        processing_profile: data.processingProfile || 'QUALITY',
+        fast_preview: data.fastPreview ? '1' : '0',
+        static_framing: data.staticFraming ? '1' : '0',
         target_clips: data.targetClips || null,
         clip_min_seconds: data.clipMinSeconds || null,
         clip_max_seconds: data.clipMaxSeconds || null,
@@ -1316,6 +1319,14 @@ function App() {
           output_format: data.outputFormat || 'auto',
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
         });
+      } else if (data.type === 'resumable_upload') {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({
+          upload_id: data.payload,
+          acknowledged: !!data.acknowledged,
+          output_format: data.outputFormat || 'auto',
+          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+        });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
@@ -1341,6 +1352,9 @@ function App() {
       }
 
       setJobId(resData.job_id);
+      if (data.type === 'resumable_upload') {
+        try { localStorage.removeItem(data.storageKey); } catch { /* ignore */ }
+      }
       setPartialJob(resData.partial || null);
       setFirstVideoJob(!!resData.first_video);
       // The server clipped past the balance on its own (no wall): the first
@@ -1349,7 +1363,7 @@ function App() {
       else if (resData.partial && !resData.partial.chosen && data.maxMinutes == null) {
         track('AutoPartial', { props: { processed: resData.partial.processed_minutes, total: resData.partial.total_minutes } });
       }
-      if (data.type === 'thumbnail_session') {
+      if (data.type === 'thumbnail_session' || data.type === 'resumable_upload') {
         setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
       }
       // Minutes are reserved at job start, not at complete.
@@ -1736,39 +1750,31 @@ function App() {
 
             {/* Hidden below sm: the standing banner underneath already says the
                 same thing, and two warnings in a 360px header is just noise. */}
-            {keysMissing && (
+            {processingModelMissing && (
               <button
                 onClick={() => (billingEnabled && !isSignedIn ? setShowLogin(true) : goToTab('settings'))}
                 className="badge-warn hover:brightness-125 transition-all hidden sm:inline-flex"
-                title="Configure API keys or choose a plan"
+                title="Configure a Gemini API key or choose a plan"
               >
                 <AlertTriangle size={12} />
                 <span className="hidden md:inline">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !geminiOk
-                      ? 'Gemini API Key Missing'
-                      : 'Upload-Post API Key Missing'}
+                  Gemini API key missing
                 </span>
-                <span className="md:hidden">keys missing</span>
+                <span className="md:hidden">key missing</span>
               </button>
             )}
           </div>
         </header>
 
         {/* Persistent Missing Keys Banner — visible on every screen */}
-        {keysMissing && activeTab !== 'settings' && (
+        {processingModelMissing && activeTab !== 'settings' && (
           <div className="mx-3 sm:mx-6 mt-3 px-3.5 sm:px-4 py-3 bg-paper2 border border-rule rounded-card flex flex-wrap items-center justify-between gap-2.5 sm:gap-4 shrink-0 animate-fade">
             <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 text-sm text-ink2 min-w-0 flex-1">
               <KeyRound size={16} className="shrink-0 text-warn mt-0.5 sm:mt-0" />
               <div className="min-w-0">
-                <span className="font-medium text-ink">Required API keys missing.</span>{' '}
+                <span className="font-medium text-ink">Gemini API key required.</span>{' '}
                 <span className="text-muted">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !geminiOk
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                  Add your Gemini API key in Settings to analyze videos and generate clips. Social publishing is optional.
                 </span>
               </div>
             </div>
@@ -1900,11 +1906,11 @@ function App() {
                     </div>
                     <h2 className="text-base font-medium text-ink lowercase">Social Integration</h2>
                   </div>
-                  <span className="badge-warn">Required</span>
+                  <span className="badge-ok">Optional</span>
                 </div>
                 <p className="text-xs text-muted mb-6 leading-relaxed">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
-                  Includes a <strong>free tier</strong> (no credit card required).
+                  Only needed to publish clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
+                  Upload, analysis, rendering, and MP4 downloads work without it.
                 </p>
                 <div className="space-y-4">
                   <label className="block text-sm text-muted">Upload-Post API Key</label>
@@ -2705,11 +2711,7 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!geminiOk && !uploadPostKey
-          ? 'Required API Keys Missing'
-          : !geminiOk
-            ? 'Gemini API Key Required'
-            : 'Upload-Post API Key Required'}
+        title="Gemini API key required"
         footer={
           <div className="flex gap-3">
             <button
@@ -2729,7 +2731,7 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts uses Gemini to analyze videos and select clips. Upload-Post is optional and only needed when you publish directly to social media.
           </p>
 
           {/* Gemini block */}
@@ -2760,36 +2762,6 @@ function App() {
             )}
           </div>
 
-          {/* Upload-Post block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!uploadPostKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
-            <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {uploadPostKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Upload-Post API Key {uploadPostKey && <span className="text-ok">— set</span>}
-            </p>
-            {!uploadPostKey && (
-              <>
-                <p className="text-xs text-muted">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
-                </p>
-                <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
-                  <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-brass underline">app.upload-post.com</a></li>
-                  <li>Connect your TikTok, Instagram, or YouTube accounts</li>
-                  <li>Go to <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-brass underline">API Keys</a> and generate one</li>
-                  <li>Paste it below</li>
-                </ol>
-                <input
-                  type="text"
-                  placeholder="Paste your Upload-Post API key here..."
-                  className="input-field"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.target.value.trim()) {
-                      setUploadPostKey(e.target.value.trim());
-                    }
-                  }}
-                />
-              </>
-            )}
-          </div>
         </div>
       </Modal>
 

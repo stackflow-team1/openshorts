@@ -12,14 +12,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
 import os
 import math
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
-import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
 from google.genai import types as genai_types
@@ -42,6 +39,7 @@ from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALIT
 from dotenv import load_dotenv
 import json
 from jsonfile import write_json_atomic
+from stage_timing import timed_stage
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -91,15 +89,30 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once (Keep for backup or scene analysis if needed)
-# YOLO_MODEL_PATH lets deployments point at a pre-downloaded weights file so a
-# volume mounted over the workdir doesn't trigger a re-download at startup.
-model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+model = None
+face_detection = None
+_MODEL_LOCK = threading.Lock()
+_FACE_DETECTION_LOCK = threading.Lock()
 
-# --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+
+def _get_yolo_model():
+    global model
+    with _MODEL_LOCK:
+        if model is None:
+            from ultralytics import YOLO
+            # A pre-downloaded weights file can avoid a model fetch at startup.
+            model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+    return model
+
+
+def get_face_detection():
+    global face_detection
+    with _FACE_DETECTION_LOCK:
+        if face_detection is None:
+            import mediapipe as mp
+            face_detection = mp.solutions.face_detection.FaceDetection(
+                model_selection=1, min_detection_confidence=0.5)
+    return face_detection
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -446,7 +459,7 @@ def detect_face_candidates(frame):
     small, _scale = _detection_frame(frame)
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
     with DETECT_LOCK:
-        results = face_detection.process(rgb_frame)
+        results = get_face_detection().process(rgb_frame)
     
     candidates = []
     
@@ -474,9 +487,9 @@ def detect_person_yolo(frame):
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
     small, scale = _detection_frame(frame)
-    # Use the globally loaded model
+    yolo_model = _get_yolo_model()
     with DETECT_LOCK:
-        results = model(small, verbose=False, classes=[0]) # class 0 is person
+        results = yolo_model(small, verbose=False, classes=[0]) # class 0 is person
 
     if not results:
         return None
@@ -2128,7 +2141,15 @@ def _free_gpu_cache():
 def transcribe_video(video_path, slot_timeout=None):
     """``slot_timeout``: seconds to wait for a host transcription slot before
     giving up with TimeoutError (None waits for as long as it takes)."""
+    import transcript_cache
+
     print("🎙️  Transcribing video...")
+    cache_key = transcript_cache.cache_key(video_path)
+    cached = transcript_cache.load(cache_key)
+    if cached is not None:
+        print(f"♻️ Reusing completed transcript cache "
+              f"({len(cached['segments'])} segments) — skipping transcription.")
+        return cached
     from transcribe_backends import (transcribe_media, release_models, host_asr_slot,
                                      media_seconds)
 
@@ -2141,15 +2162,17 @@ def transcribe_video(video_path, slot_timeout=None):
     # jobs failing per hour at peak). Nothing after this point transcribes.
     # A long source never takes the last slot (ASR_LONG_SECONDS), and whisper
     # hands the slot back if it falls to the CPU.
-    with host_asr_slot(timeout=slot_timeout, media_seconds=media_seconds(video_path)):
-        try:
-            transcript = transcribe_media(video_path)
-        finally:
+    with timed_stage("transcription"):
+        with host_asr_slot(timeout=slot_timeout, media_seconds=media_seconds(video_path)):
             try:
-                release_models()
-            except Exception as e:
-                print(f"⚠️ [ASR] could not release models ({type(e).__name__}: {e})")
+                transcript = transcribe_media(video_path)
+            finally:
+                try:
+                    release_models()
+                except Exception as e:
+                    print(f"⚠️ [ASR] could not release models ({type(e).__name__}: {e})")
 
+    transcript_cache.store(cache_key, transcript)
     print(f"   Detected language '{transcript['language']}', "
           f"{len(transcript['segments'])} segments")
     for segment in transcript['segments']:
@@ -2276,8 +2299,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            print("❌ Error: GEMINI_API_KEY not found in environment variables "
-                  "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
+            print("❌ Error: GEMINI_API_KEY not found in environment variables.")
             return None
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
@@ -2303,9 +2325,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
 
         # --- Pass 1: score windows in batches, keep the highest-scoring ---
         scored = []
-        # Local models usually run with a 4-8k context (Ollama defaults to
-        # 4096 unless OLLAMA_CONTEXT_LENGTH says otherwise) and 8 windows of
-        # transcript do not fit; a silently truncated prompt scores garbage.
+        # Local-compatible servers often run with a 4-8k context and eight
+        # transcript windows do not fit; a silently truncated prompt scores garbage.
         SCORE_BATCH = score_batch_size()
         # The batches only split the work: the prompt scores every window it
         # is given and the shortlist below is the global top `target`. Letting

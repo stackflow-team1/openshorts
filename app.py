@@ -1,5 +1,5 @@
+import errno
 import os
-import llm_backend
 import re
 import sys
 import uuid
@@ -42,6 +42,16 @@ from jsonfile import write_json_atomic
 
 load_dotenv()
 
+def _positive_int_env(name, default):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 # Constants
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "output"
@@ -51,7 +61,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = _positive_int_env("MAX_FILE_SIZE_MB", 4096)
+MAX_CONCURRENT_UPLOADS = _positive_int_env("MAX_CONCURRENT_UPLOADS", 2)
+UPLOAD_CHUNK_SIZE_MB = _positive_int_env("UPLOAD_CHUNK_SIZE_MB", 8)
+UPLOAD_CHUNK_SIZE_BYTES = UPLOAD_CHUNK_SIZE_MB * 1024 * 1024
+UPLOAD_TTL_SECONDS = _positive_int_env("UPLOAD_TTL_SECONDS", 6 * 3600)
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -5646,9 +5660,7 @@ async def get_config(response: Response):
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
-        # Self-host only: tells the dashboard the Gemini key is optional
-        # because the moment picker runs on an OpenAI-compatible server.
-        "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        "geminiConfigured": bool(not BILLING_ENABLED and os.environ.get("GEMINI_API_KEY")),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5807,9 +5819,9 @@ LAYOUT_IMPLIES = {
 # process time so a leaked id cannot start a job on someone else's account.
 # --------------------------------------------------------------------------- #
 pending_uploads: Dict[str, Dict] = {}
-# Unconsumed slots are gone after this; a consumed one becomes the job's
-# input and follows the job's own retention instead.
-UPLOAD_TTL_SECONDS = int(os.environ.get("UPLOAD_TTL_SECONDS", str(6 * 3600)))
+UPLOAD_EXTENSIONS = frozenset({
+    ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm",
+})
 
 
 def _upload_url_base(request):
@@ -5860,6 +5872,274 @@ async def create_upload(request: Request):
     }
 
 
+def _safe_upload_filename(filename):
+    """Reduce a client filename to a safe basename and enforce video formats."""
+    name = str(filename or "").replace("\\", "/").split("/")[-1]
+    if not name or "\x00" in name:
+        raise HTTPException(status_code=400, detail="A valid video filename is required")
+    name = _clamp_upload_name(name)
+    if os.path.splitext(name)[1].lower() not in UPLOAD_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported video file extension")
+    return name
+
+
+def _upload_session(upload_id):
+    try:
+        if str(uuid.UUID(upload_id)) != upload_id:
+            raise ValueError("non-canonical UUID")
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    slot = pending_uploads.get(upload_id)
+    if (not slot or slot.get("upload_mode") != "chunks"
+            or time.time() - slot["created"] > UPLOAD_TTL_SECONDS):
+        raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    return slot
+
+
+def _upload_session_response(upload_id, slot):
+    return {
+        "upload_id": upload_id,
+        "filename": slot["filename"],
+        "size": slot["expected_size"],
+        "chunk_size": slot["chunk_size"],
+        "total_chunks": slot["total_chunks"],
+        "received_chunks": sorted(int(i) for i in slot["received"]),
+        "next_chunk": len(slot["received"]),
+        "complete": bool(slot.get("complete")),
+        "status": "complete" if slot.get("complete") else "uploading",
+        "expires_in": max(0, UPLOAD_TTL_SECONDS - int(time.time() - slot["created"])),
+    }
+
+
+def _check_resumable_upload_capacity(expected_size):
+    now = time.time()
+    reserved_bytes = sum(
+        max(0, 2 * slot["expected_size"] - slot.get("bytes", 0))
+        for slot in pending_uploads.values()
+        if slot.get("upload_mode") == "chunks"
+        and not slot.get("complete")
+        and now - slot["created"] <= UPLOAD_TTL_SECONDS
+    )
+    required_bytes = reserved_bytes + 2 * expected_size
+    if shutil.disk_usage(UPLOAD_DIR).free < required_bytes:
+        raise HTTPException(
+            status_code=507,
+            detail="Insufficient disk space for this upload and its assembly.")
+
+
+@app.post("/api/uploads/init")
+async def init_chunked_upload(request: Request):
+    """Create a resumable upload session without receiving the video body."""
+    user_id = await _owner_id(request)
+    if BILLING_ENABLED and user_id is None:
+        raise HTTPException(status_code=401, detail="Sign in or use an API key to upload")
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Expected a JSON upload description")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON upload description")
+    filename = _safe_upload_filename(body.get("filename"))
+    raw_size = body.get("size")
+    if isinstance(raw_size, bool) or (
+            isinstance(raw_size, float) and not raw_size.is_integer()):
+        raise HTTPException(status_code=400, detail="size must be a positive integer")
+    try:
+        expected_size = int(raw_size)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="size must be a positive integer")
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    if expected_size <= 0:
+        raise HTTPException(status_code=400, detail="size must be a positive integer")
+    if expected_size > limit_bytes:
+        raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+
+    active_sessions = sum(
+        1 for slot in pending_uploads.values()
+        if slot.get("upload_mode") == "chunks"
+        and not slot.get("complete")
+        and time.time() - slot["created"] <= UPLOAD_TTL_SECONDS
+    )
+    if active_sessions >= MAX_CONCURRENT_UPLOADS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"The maximum of {MAX_CONCURRENT_UPLOADS} active uploads has been reached.")
+
+    if BILLING_ENABLED:
+        now = time.time()
+        open_slots = sum(1 for sl in pending_uploads.values()
+                         if sl.get("user_id") == user_id
+                         and now - sl["created"] <= UPLOAD_TTL_SECONDS)
+        cap = _cloud_config.MAX_PENDING_UPLOADS_PER_USER
+        if open_slots >= cap:
+            raise HTTPException(status_code=429, detail=(
+                f"You have {open_slots} unused upload slots open (the most is {cap}). "
+                "Process or DELETE one, or wait for it to expire."))
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    _check_resumable_upload_capacity(expected_size)
+    upload_id = str(uuid.uuid4())
+    chunk_dir = os.path.join(UPLOAD_DIR, ".chunks", upload_id)
+    os.makedirs(os.path.dirname(chunk_dir), mode=0o700, exist_ok=True)
+    os.makedirs(chunk_dir, mode=0o700, exist_ok=False)
+    chunk_size = UPLOAD_CHUNK_SIZE_BYTES
+    total_chunks = (expected_size + chunk_size - 1) // chunk_size
+    slot = {
+        "user_id": user_id,
+        "filename": filename,
+        "path": os.path.join(UPLOAD_DIR, f"pending_{upload_id}_{filename}"),
+        "chunk_dir": chunk_dir,
+        "created": time.time(),
+        "bytes": 0,
+        "complete": False,
+        "upload_mode": "chunks",
+        "expected_size": expected_size,
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+        "received": {},
+        "lock": asyncio.Lock(),
+    }
+    pending_uploads[upload_id] = slot
+    return _upload_session_response(upload_id, slot)
+
+
+@app.put("/api/uploads/{upload_id}/chunks/{index}")
+async def put_upload_chunk(upload_id: str, index: int, request: Request):
+    """Stream one ordered binary chunk to a UUID-contained temporary file."""
+    slot = _upload_session(upload_id)
+    if BILLING_ENABLED and slot.get("user_id") != await _owner_id(request):
+        raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    async with slot["lock"]:
+        if slot.get("complete"):
+            raise HTTPException(status_code=409, detail="Upload is already complete")
+        if index < 0 or index >= slot["total_chunks"]:
+            raise HTTPException(status_code=416, detail="Chunk index is outside this upload")
+        expected_bytes = min(
+            slot["chunk_size"], slot["expected_size"] - index * slot["chunk_size"])
+        received = slot["received"]
+        next_chunk = len(received)
+        if index > next_chunk:
+            raise HTTPException(status_code=409, detail=f"Expected chunk {next_chunk} next")
+
+        temp_path = os.path.join(slot["chunk_dir"], f".{index}.{uuid.uuid4().hex}.tmp")
+        chunk_path = os.path.join(slot["chunk_dir"], f"{index:08d}.part")
+        size = 0
+        digest = hashlib.sha256()
+        try:
+            with open(temp_path, "xb") as out:
+                async for data in request.stream():
+                    size += len(data)
+                    if size > expected_bytes:
+                        raise HTTPException(status_code=413, detail="Chunk exceeds its expected size")
+                    digest.update(data)
+                    out.write(data)
+            if size != expected_bytes:
+                raise HTTPException(status_code=400, detail="Chunk size does not match its expected size")
+            checksum = digest.hexdigest()
+            prior = received.get(str(index))
+            if prior is not None:
+                if prior["sha256"] != checksum or prior["bytes"] != size:
+                    raise HTTPException(status_code=409, detail="Chunk retry did not match the stored chunk")
+                return {"upload_id": upload_id, "index": index, "bytes": size,
+                        "next_chunk": len(received), "duplicate": True}
+            os.replace(temp_path, chunk_path)
+            received[str(index)] = {"bytes": size, "sha256": checksum}
+            slot["bytes"] = sum(part["bytes"] for part in received.values())
+            return {"upload_id": upload_id, "index": index, "bytes": size,
+                    "next_chunk": len(received), "duplicate": False}
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                raise HTTPException(status_code=507, detail="Insufficient disk space for upload") from e
+            raise HTTPException(status_code=500, detail="Could not store upload chunk") from e
+        finally:
+            _remove_if_present(temp_path)
+
+
+@app.get("/api/uploads/{upload_id}/status")
+async def get_upload_status(upload_id: str, request: Request):
+    slot = _upload_session(upload_id)
+    if BILLING_ENABLED and slot.get("user_id") != await _owner_id(request):
+        raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    return _upload_session_response(upload_id, slot)
+
+
+def _assemble_upload(slot):
+    """Verify each chunk and stream it to a temporary assembled video file."""
+    expected_size = slot["expected_size"]
+    if len(slot["received"]) != slot["total_chunks"]:
+        raise HTTPException(status_code=409, detail="Upload is missing one or more chunks")
+    temp_path = slot["path"] + f".{uuid.uuid4().hex}.assembling"
+    assembled_size = 0
+    try:
+        with open(temp_path, "xb") as assembled:
+            for index in range(slot["total_chunks"]):
+                part_path = os.path.join(slot["chunk_dir"], f"{index:08d}.part")
+                part_info = slot["received"].get(str(index))
+                if not part_info:
+                    raise HTTPException(status_code=409, detail=f"Missing chunk {index}")
+                digest = hashlib.sha256()
+                part_size = 0
+                with open(part_path, "rb") as part:
+                    while data := part.read(1024 * 1024):
+                        part_size += len(data)
+                        digest.update(data)
+                        assembled.write(data)
+                if part_size != part_info["bytes"] or digest.hexdigest() != part_info["sha256"]:
+                    raise HTTPException(status_code=400, detail=f"Chunk {index} failed integrity verification")
+                assembled_size += part_size
+        if assembled_size != expected_size:
+            raise HTTPException(status_code=400, detail="Assembled file size does not match the upload")
+        metadata = _probe_uploaded_video(temp_path)
+        os.replace(temp_path, slot["path"])
+        slot.update({"complete": True, "bytes": assembled_size,
+                     "duration_seconds": metadata["duration_seconds"]})
+        shutil.rmtree(slot["chunk_dir"], ignore_errors=True)
+        return metadata
+    except OSError as e:
+        if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+            raise HTTPException(
+                status_code=507, detail="Insufficient disk space to assemble upload") from e
+        raise HTTPException(status_code=500, detail="Could not assemble upload") from e
+    finally:
+        _remove_if_present(temp_path)
+
+
+def _probe_uploaded_video(path):
+    """Require a readable video stream and positive media duration."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type", "-of", "json", path],
+            capture_output=True, text=True, timeout=60, check=True)
+        metadata = json.loads(result.stdout)
+        duration = float((metadata.get("format") or {}).get("duration") or 0)
+        has_video = any(s.get("codec_type") == "video"
+                        for s in metadata.get("streams") or [])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail="Could not read uploaded video metadata")
+    if not has_video or duration <= 0:
+        raise HTTPException(status_code=400, detail="The upload does not contain a readable video stream")
+    return {"duration_seconds": round(duration, 1)}
+
+
+@app.post("/api/uploads/{upload_id}/complete")
+async def complete_chunked_upload(upload_id: str, request: Request):
+    slot = _upload_session(upload_id)
+    if BILLING_ENABLED and slot.get("user_id") != await _owner_id(request):
+        raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    async with slot["lock"]:
+        if not slot.get("complete"):
+            if shutil.disk_usage(UPLOAD_DIR).free < slot["expected_size"]:
+                raise HTTPException(
+                    status_code=507,
+                    detail="Insufficient disk space to assemble this upload.")
+            metadata = await asyncio.to_thread(_assemble_upload, slot)
+        else:
+            metadata = {"duration_seconds": slot["duration_seconds"]}
+    return {**_upload_session_response(upload_id, slot), **metadata,
+            "hint": "Upload assembled; pass upload_id to /api/process."}
+
+
 def _remove_if_present(path):
     try:
         os.remove(path)
@@ -5904,6 +6184,17 @@ async def delete_upload(upload_id: str, request: Request):
     slot = pending_uploads.get(upload_id)
     if not slot or (BILLING_ENABLED and slot.get("user_id") != await _owner_id(request)):
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    if slot.get("upload_mode") == "chunks":
+        async with slot["lock"]:
+            if slot.get("complete"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The assembled source is preserved; process it with upload_id instead.")
+            if pending_uploads.get(upload_id) is not slot:
+                raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+            pending_uploads.pop(upload_id, None)
+            shutil.rmtree(slot["chunk_dir"], ignore_errors=True)
+        return {"deleted": upload_id}
     pending_uploads.pop(upload_id, None)
     try:
         os.remove(slot["path"])
@@ -5920,6 +6211,14 @@ def _sweep_pending_uploads(now=None):
     for uid, slot in list(pending_uploads.items()):
         if now - slot["created"] > UPLOAD_TTL_SECONDS:
             pending_uploads.pop(uid, None)
+            if slot.get("upload_mode") == "chunks":
+                shutil.rmtree(slot["chunk_dir"], ignore_errors=True)
+                # Completion turned the upload into a normal pending source.
+                # Its existing source-retention sweep, not session expiry,
+                # owns cleanup from this point onward.
+                if slot.get("complete"):
+                    gone.append(uid)
+                    continue
             try:
                 os.remove(slot["path"])
             except OSError:
@@ -6049,13 +6348,12 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    processing_profile: Optional[str] = Form("QUALITY"),
+    fast_preview: Optional[str] = Form(None),
+    static_framing: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
-        # Self-host with an OpenAI-compatible server configured needs no
-        # Google key for the core pipeline: the moment picker runs there and
-        # the frame-based stages degrade on their own (layout_picker returns
-        # "none", silent videos fail with a message that says why).
+    if not api_key:
         raise gemini_missing_error()
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
@@ -6083,6 +6381,16 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        processing_profile = body.get("processing_profile", "QUALITY")
+        fast_preview = body.get("fast_preview")
+        static_framing = body.get("static_framing")
+
+    processing_profile = str(processing_profile or "QUALITY").strip().upper()
+    if processing_profile not in ("QUALITY", "BALANCED", "FAST"):
+        raise HTTPException(
+            status_code=400, detail="processing_profile must be QUALITY, BALANCED, or FAST")
+    fast_preview_enabled = str(fast_preview).strip().lower() not in ("0", "false", "no", "off")
+    static_framing_enabled = str(static_framing).strip().lower() in ("1", "true", "yes", "on")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -6164,10 +6472,20 @@ async def process_endpoint(
     # probe above already gets this right.
     cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
     env = child_env()
+    env["PROCESSING_PROFILE"] = processing_profile
+    env["FAST_PREVIEW"] = "1" if fast_preview_enabled else "0"
+    env["STATIC_FRAMING"] = "1" if static_framing_enabled else "0"
+    if processing_profile == "FAST":
+        env["SCENE_DETECTION"] = "0"
+    elif processing_profile == "BALANCED":
+        env["SCENE_DETECTION"] = "1"
+        env["SCENE_ENGINE"] = "pyscenedetect"
+    else:
+        env["SCENE_DETECTION"] = "1"
     if api_key:
         env["GEMINI_API_KEY"] = api_key # Override with key from request
     else:
-        env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
+        env.pop("GEMINI_API_KEY", None)
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job
@@ -9274,7 +9592,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
     # used and their own profile is forced (body api_key / user_id are ignored).
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
     if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+        raise HTTPException(
+            status_code=400,
+            detail="Upload-Post is optional and only needed to publish clips. "
+                   "Configure it in Settings to publish; generation and downloads do not need it.")
     post_user = resolve_post_profile(forced_profile, req.user_id)
 
     # The awaits above can let cleanup or an account delete drop the job.

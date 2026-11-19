@@ -755,7 +755,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
 
     const handlePost = async () => {
         if (!canPost) {
-            setPostResult({ success: false, msg: "Missing API Key or User ID." });
+            setPostResult({ success: false, msg: "Upload-Post is optional and is only needed to publish. Configure it in Settings to publish this clip." });
             return;
         }
 
@@ -1209,7 +1209,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 title="post clip"
                 size="md"
                 footer={
-                    noAccountsConnected ? (
+                    noAccountsConnected && canPost ? (
                         <button onClick={handleConnectAccounts} className="btn-primary w-full">
                             <Link2 size={16} /> connect accounts
                         </button>
@@ -1227,11 +1227,11 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 {!canPost && (
                     <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div className="lowercase">configure api key in settings first.</div>
+                        <div className="lowercase">upload-post is optional and only needed to publish. configure it in settings to publish this clip.</div>
                     </div>
                 )}
 
-                {noAccountsConnected && (
+                {noAccountsConnected && canPost && (
                     <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />
                         <div className="lowercase">no social accounts connected yet — link tiktok, instagram, youtube, facebook, linkedin, threads or bluesky to publish this clip.</div>

@@ -91,6 +91,20 @@ Registration is capped per client IP (`OAUTH_REGISTRATIONS_PER_HOUR`, 429
 stuck in a loop. Agent upload slots (`POST /api/uploads`) are capped at
 `MAX_PENDING_UPLOADS_PER_USER` open at once.
 
+The dashboard uses the same upload slot and `/api/process` handoff for large
+files: `POST /api/uploads/init` reserves a UUID session, ordered raw binary
+chunks go to `PUT /api/uploads/{id}/chunks/{index}`, and `GET
+/api/uploads/{id}/status` reports resumable progress. `POST
+/api/uploads/{id}/complete` verifies and streams the chunks into the normal
+pending source file; the existing `upload_id` process path then starts the job.
+The dashboard resumes a session when the same file is selected again, including
+after a page refresh. Chunks default to 8 MiB, at most two resumable sessions
+are active by default, and incomplete sessions expire after six hours. These
+limits are configurable with `UPLOAD_CHUNK_SIZE_MB`,
+`MAX_CONCURRENT_UPLOADS`, and `UPLOAD_TTL_SECONDS`.
+`MAX_FILE_SIZE_MB` defaults to 4096 MiB. Session creation checks disk capacity
+for both chunk storage and assembly; assembly checks available space again.
+
 ## Webhooks
 
 `POST /api/process` takes `webhook_url` + optional `webhook_secret`

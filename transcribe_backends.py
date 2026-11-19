@@ -38,6 +38,7 @@ from subtitles import (
     WHISPER_TRANSCRIBE_PARAMS,
     merge_continuation_words,
 )
+from stage_timing import timed_stage
 
 PARAKEET_MODEL_ID = "nemo-parakeet-tdt-0.6b-v3"
 
@@ -238,8 +239,9 @@ def _get_whisper_model():
         if _whisper_model is None or _whisper_key != key:
             from faster_whisper import WhisperModel
             kwargs = {"cpu_threads": whisper_cpu_threads()} if key[1] == "cpu" else {}
-            _whisper_model = WhisperModel(key[0], device=key[1], compute_type=key[2],
-                                          **kwargs)
+            with timed_stage("model_initialization"):
+                _whisper_model = WhisperModel(key[0], device=key[1],
+                                              compute_type=key[2], **kwargs)
             _whisper_key = key
     return _whisper_model, cfg["device"]
 

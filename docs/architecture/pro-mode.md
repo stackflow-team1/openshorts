@@ -38,8 +38,8 @@ is shown away from what is said.
   captions through `_reapply_captions` (so in the clip's `caption_style`),
   the free plan's mark through `_deliver`.
 - **Titles** (`pick_titles`, `sanitize_titles`, `place_titles`,
-  `write_titles`): one model call per conversion proposes the words (Gemini
-  with the caller's entitlement, `resolve_gemini`, or the local LLM); without
+  `write_titles`): one Gemini call per conversion proposes the words (resolved
+  with the caller's entitlement through `resolve_gemini`); without
   a model, or on any failure, the clip simply has none. The code keeps only
   words really spoken at the index the model names (a drifted proposal falls
   back to the spoken word), and places them on the cut timeline: only where

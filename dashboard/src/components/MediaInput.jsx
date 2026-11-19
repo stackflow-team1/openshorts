@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown, Pause, Play } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
+import { hasSavedUpload, uploadVideo } from '../lib/resumableUpload';
 import SourceCost from './SourceCost';
 import { useAuth } from '../contexts/AuthContext';
 import { FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from '../lib/clipProgress';
@@ -16,6 +17,12 @@ const SUPPORTED_PLATFORMS = [
 // says so the moment the file is picked (a 27 s upload used to end in a bare
 // "That run failed").
 const MIN_SOURCE_SECONDS = 45;
+const formatUploadTime = (seconds) => {
+    if (!Number.isFinite(seconds)) return 'Estimating…';
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`;
+};
 
 // Duration of a local video file in seconds, or null when the browser cannot
 // read it (unsupported codec): then the server stays the judge.
@@ -40,6 +47,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
     const [fileSeconds, setFileSeconds] = useState(null);
+    const [uploadingFile, setUploadingFile] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState({
+        percent: 0, loaded: 0, total: 0, chunkIndex: 0, totalChunks: 0,
+        speedBps: 0, etaSeconds: null,
+    });
+    const [uploadPaused, setUploadPaused] = useState(false);
+    const [uploadError, setUploadError] = useState('');
     const fileTooShort = fileSeconds != null && fileSeconds < MIN_SOURCE_SECONDS;
     const [acknowledged, setAcknowledged] = useState(false);
     // {start, end} in seconds when the user picked a stretch under the cost line.
@@ -52,6 +66,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
+    const [processingProfile, setProcessingProfile] = useState(() => {
+        try { return localStorage.getItem('os_processing_profile') || 'QUALITY'; } catch { return 'QUALITY'; }
+    });
+    const [fastPreview, setFastPreview] = useState(true);
+    const [staticFraming, setStaticFraming] = useState(false);
     // Auto-hook: burn the AI hook text into every clip. On by default; the
     // choice persists so turning it off sticks across sessions.
     const [autoHook, setAutoHook] = useState(() => {
@@ -68,6 +87,18 @@ export default function MediaInput({ onProcess, isProcessing }) {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
     const infoRef = useRef(null);
+    const uploadControlRef = useRef(null);
+    const uploadAbortRef = useRef(null);
+
+    const toggleUploadPause = () => {
+        const control = uploadControlRef.current;
+        if (!control) return;
+        control.paused = !control.paused;
+        setUploadPaused(control.paused);
+        if (!control.paused) {
+            [...control.waiters].forEach((resume) => resume());
+        }
+    };
 
     // Close the compatibility popover on any outside click.
     useEffect(() => {
@@ -120,13 +151,16 @@ export default function MediaInput({ onProcess, isProcessing }) {
         }
     }, []);
 
-    const handleSubmit = (e) => {
+    const handleSubmit = async (e) => {
         e.preventDefault();
-        if (!acknowledged) return;
+        if (!acknowledged || uploadingFile) return;
         const advanced = {
             targetClips: targetClips || null,
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
+            processingProfile,
+            fastPreview,
+            staticFraming,
             autoHook,
             autoHookStyle,
             layout,
@@ -137,11 +171,57 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_processing_profile', processingProfile);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
         } else if (mode === 'file' && file && !fileTooShort) {
-            onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
+            setUploadError('');
+            if (file.size > 4096 * 1024 * 1024) {
+                setUploadError('This file exceeds the 4 GiB upload limit.');
+                return;
+            }
+            if (file.size <= 64 * 1024 * 1024) {
+                onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
+                return;
+            }
+            setUploadingFile(true);
+            setUploadProgress({
+                percent: 0, loaded: 0, total: file.size, chunkIndex: 0,
+                totalChunks: 0, speedBps: 0, etaSeconds: null,
+            });
+            setUploadPaused(false);
+            const control = { paused: false, waiters: new Set() };
+            const controller = new AbortController();
+            uploadControlRef.current = control;
+            uploadAbortRef.current = controller;
+            try {
+                const uploaded = await uploadVideo(file, (progress) => {
+                    setUploadProgress({
+                        ...progress,
+                        percent: progress.total
+                            ? Math.floor((progress.loaded / progress.total) * 100)
+                            : 0,
+                    });
+                }, { signal: controller.signal, control });
+                await onProcess({
+                    ...uploaded,
+                    acknowledged: true,
+                    outputFormat,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    ...advanced,
+                });
+            } catch (error) {
+                if (error?.name !== 'AbortError') {
+                    setUploadError(error?.message || 'Upload failed. Your resumable upload is kept for retry.');
+                }
+            } finally {
+                uploadControlRef.current = null;
+                uploadAbortRef.current = null;
+                setUploadingFile(false);
+                setUploadPaused(false);
+            }
         }
     };
 
@@ -234,6 +314,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 <button
                                     type="button"
                                     onClick={() => setFile(null)}
+                                    disabled={uploadingFile}
                                     className="p-1 text-muted hover:text-ink hover:bg-paper3 rounded-full transition-colors"
                                 >
                                     <X size={16} />
@@ -246,6 +327,58 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 of footage to cut from: it already is a short. Pick a longer video.
                             </p>
                         ) : null}
+                        {uploadingFile && (
+                            <div className="mt-3" role="status" aria-live="polite">
+                                <div className="flex justify-between text-xs text-muted mb-1">
+                                    <span>{uploadPaused ? 'Paused' : 'Uploading video…'}</span>
+                                    <span>{uploadProgress.percent}%</span>
+                                </div>
+                                <progress className="w-full h-2" value={uploadProgress.percent} max="100">
+                                    {uploadProgress.percent}%
+                                </progress>
+                                <div className="flex flex-wrap justify-between gap-x-3 text-xs text-muted mt-1">
+                                    <span>
+                                        {(uploadProgress.loaded / (1024 * 1024)).toFixed(1)} MB /
+                                        {' '}{(uploadProgress.total / (1024 * 1024)).toFixed(1)} MB
+                                    </span>
+                                    {uploadProgress.totalChunks > 0 && (
+                                        <span>Chunk {Math.min(uploadProgress.chunkIndex, uploadProgress.totalChunks)} / {uploadProgress.totalChunks}</span>
+                                    )}
+                                    <span>{(uploadProgress.speedBps / (1024 * 1024)).toFixed(2)} MB/s</span>
+                                    <span>About {formatUploadTime(uploadProgress.etaSeconds)}</span>
+                                </div>
+                                <div className="flex gap-2 mt-2">
+                                    <button
+                                        type="button"
+                                        onClick={toggleUploadPause}
+                                        className="btn-quiet px-3 py-1 text-xs"
+                                    >
+                                        {uploadPaused ? <Play size={14} /> : <Pause size={14} />}
+                                        {uploadPaused ? 'Resume' : 'Pause'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => uploadAbortRef.current?.abort()}
+                                        className="btn-quiet px-3 py-1 text-xs text-danger"
+                                    >
+                                        Cancel upload
+                                    </button>
+                                    {uploadPaused && (
+                                        <span className="self-center text-xs text-muted">
+                                            The current chunk will finish before pausing.
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                        {file && !uploadingFile && hasSavedUpload(file) && (
+                            <p className="text-xs text-brass mt-2" role="status">
+                                Resumable upload found. It will continue from the last saved chunk.
+                            </p>
+                        )}
+                        {uploadError && (
+                            <p className="text-danger text-sm mt-3" role="alert">{uploadError}</p>
+                        )}
                         {!file && (
                             <label className="cursor-pointer block">
                                 <input
@@ -256,7 +389,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 />
                                 <Upload className="mx-auto mb-3 text-muted" size={18} />
                                 <p className="text-ink2 lowercase">Click to upload or drag and drop</p>
-                                <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
+                                <p className="readout mt-2">MP4, MOV and other video formats up to 4 GiB · at least {MIN_SOURCE_SECONDS}s long</p>
                             </label>
                         )}
                     </div>
@@ -324,6 +457,19 @@ export default function MediaInput({ onProcess, isProcessing }) {
                            ~100px each, which crushes both label and value. */
                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-2 animate-fade">
                             <div>
+                                <p className="eyebrow mb-1.5">processing profile</p>
+                                <select
+                                    value={processingProfile}
+                                    onChange={(e) => setProcessingProfile(e.target.value)}
+                                    className="input-field"
+                                    aria-label="Processing profile"
+                                >
+                                    <option value="QUALITY">Quality · best accuracy</option>
+                                    <option value="BALANCED">Balanced · faster processing</option>
+                                    <option value="FAST">Fast · preview speed</option>
+                                </select>
+                            </div>
+                            <div>
                                 <p className="eyebrow mb-1.5">clips to aim for</p>
                                 <input
                                     type="number" min="1" max="15" step="1"
@@ -358,6 +504,28 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide.
                                 {plan === 'free' && ` The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video, fewer while its queue is busy; plans get every clip, up to ${MAX_CLIPS_PER_VIDEO}.`}
                             </p>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap gap-x-6 gap-y-3">
+                                {processingProfile === 'FAST' && (
+                                    <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                        <input
+                                            type="checkbox"
+                                            checked={fastPreview}
+                                            onChange={(e) => setFastPreview(e.target.checked)}
+                                            className="w-4 h-4 accent-[var(--color-accent)]"
+                                        />
+                                        Render 720×1280 preview
+                                    </label>
+                                )}
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={staticFraming}
+                                        onChange={(e) => setStaticFraming(e.target.checked)}
+                                        className="w-4 h-4 accent-[var(--color-accent)]"
+                                    />
+                                    Screen recording: preserve full frame with static framing
+                                </label>
+                            </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select
@@ -423,10 +591,15 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 <button
                     type="submit"
                     data-tutorial="generate"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
+                    disabled={isProcessing || uploadingFile || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
                     className="w-full btn-primary mt-4"
                 >
-                    {isProcessing ? (
+                    {uploadingFile ? (
+                        <>
+                            <Loader2 size={16} className="animate-spin" />
+                            Uploading Video… {uploadProgress.percent}%
+                        </>
+                    ) : isProcessing ? (
                         <>
                             <Loader2 size={16} className="animate-spin" />
                             Processing Video...

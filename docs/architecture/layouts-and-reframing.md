@@ -62,7 +62,7 @@ the layout picker called the video a screencast), three frames from those
 stretches at 1024px plus the clip's own words go to Gemini (`GroundedHook`) and
 `viral_hook_text` / `video_title_for_youtube_short` are rewritten in place before
 `auto_hook_clip` burns them; the originals stay under `hook_grounding.before`.
-Gemini-only (frames): with just a local LLM it logs one line and keeps the
+Gemini-only (frames): when Gemini is unavailable it logs one line and keeps the
 transcript hook. `HOOK_GROUNDING=0` disables it. The detail prompt also carries
 the rule "about this moment, not the video".
 

@@ -1,0 +1,36 @@
+{
+  "name": "OpenShorts",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true,
+      "dockerDashComposeVersion": "v2",
+      "enableNonRootDocker": true
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "GitHub.copilot",
+        "GitHub.copilot-chat"
+      ]
+    }
+  },
+  "forwardPorts": [
+    5175,
+    8000,
+    3100
+  ],
+  "portsAttributes": {
+    "5175": {
+      "label": "Frontend dashboard"
+    },
+    "8000": {
+      "label": "Backend API"
+    },
+    "3100": {
+      "label": "Video renderer"
+    }
+  }
+}

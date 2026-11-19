@@ -144,6 +144,15 @@ def test_public_config_may_be_reused_by_the_browser():
     assert "max-age=" in res.headers.get("cache-control", "")
 
 
+def test_public_config_reports_only_whether_server_gemini_key_exists(monkeypatch):
+    monkeypatch.setattr(app_module, "BILLING_ENABLED", False)
+    monkeypatch.setenv("GEMINI_API_KEY", "server-secret")
+    res = TestClient(app_module.app).get("/api/config")
+    assert res.status_code == 200
+    assert res.json()["geminiConfigured"] is True
+    assert "server-secret" not in res.text
+
+
 def test_partial_result_is_parsed_again_only_when_something_changed(tmp_path, monkeypatch):
     import json as _json
     job_id = "j-partial"

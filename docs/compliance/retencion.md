@@ -19,7 +19,7 @@ alargarlos por encima de lo que dice la política sin actualizarla.
 |---|---|---|
 | Directorio del trabajo (`output/<job_id>`): vídeo de origen descargado (o traído de vuelta de R2 por el editor, `.source_archive.*`), clips renderizados, checkpoint de transcripción, sidecars | **1 h** desde la última escritura | `app.cleanup_jobs`, `JOB_RETENTION_SECONDS` (3600 en cloud; 86400 en autoalojado) |
 | Descarga de origen conservada de un trabajo por URL | Igual que el trabajo, o antes si se configura | `app._sweep_retained_sources`, `SOURCE_RETENTION_SECONDS` |
-| Subidas pendientes de trabajo (huecos de subida para agentes) | **6 h** | `app._sweep_pending_uploads`, `UPLOAD_TTL_SECONDS` |
+| Subidas pendientes de trabajo y sesiones incompletas reanudables | **6 h por defecto**, configurable | `app._sweep_pending_uploads`, `UPLOAD_TTL_SECONDS` |
 | Ficheros en `uploads/` | **1 h** (misma vuelta del barrido) | `app.cleanup_jobs` |
 | **Miniaturas generadas y fotogramas muestreados** (`output/thumbnails/<sesión>`) — recortes de la cara del presentador | **24 h desde la última descarga**; servir un fichero reinicia el reloj | `app._sweep_thumbnail_sessions`, `THUMBNAIL_RETENTION_SECONDS` |
 | **Fotos de actor subidas** (`output/actor_uploads/*.png`) — fotografías de personas | **1 h** (el reloj del trabajo) | `app._sweep_actor_uploads`, `ACTOR_UPLOAD_RETENTION_SECONDS` |

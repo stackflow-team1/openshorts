@@ -106,6 +106,20 @@ def test_new_job_drops_the_paid_proxy_once_the_budget_is_spent(dirs, monkeypatch
     assert ("PROXY_URL" in env) is has_proxy
 
 
+def test_processing_requires_gemini_key(dirs, monkeypatch):
+    monkeypatch.setattr(app_module, "BILLING_ENABLED", False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(app_module, "reserve_process_minutes", _fake_reserve(False))
+    monkeypatch.setattr(app_module, "_quality_gate", _no_gate)
+    monkeypatch.setattr(app_module, "_validate_source_url", _allow)
+
+    resp = _call("post", "/api/process",
+                 json={"url": "https://www.youtube.com/watch?v=ok", "acknowledged": True})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Missing X-Gemini-Key header"
+
+
 def test_budget_check_is_off_in_self_host(monkeypatch):
     monkeypatch.setattr(app_module, "BILLING_ENABLED", False)
     assert asyncio.run(app_module._paid_proxy_budget_exceeded()) is False

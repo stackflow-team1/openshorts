@@ -31,6 +31,8 @@ import layout_ranges
 import split_layout
 from ffmpeg_utils import (video_encode_args, blurred_backdrop, escape_filter_value,
                           QUALITY_FAST, METADATA_SCRUB)
+from processing_profiles import current_profile, fast_preview_enabled
+from stage_timing import timed_stage
 
 ANALYSIS_MAX_WIDTH = 640
 
@@ -61,6 +63,13 @@ def delivery_size(orig_w, orig_h, aspect_ratio):
 
     if out_w < DELIVERY_MIN_WIDTH:
         out_w = DELIVERY_MIN_WIDTH
+        out_h = int(round(out_w / aspect_ratio))
+
+    profile = current_profile()
+    max_width = (720 if profile == "FAST" and fast_preview_enabled()
+                 else 1080 if profile == "BALANCED" else None)
+    if max_width and out_w > max_width:
+        out_w = max_width
         out_h = int(round(out_w / aspect_ratio))
 
     return out_w + (out_w % 2), out_h + (out_h % 2)
@@ -687,6 +696,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # whole frame into the middle of a blurred copy of itself. Skip the
     # classifier and every layout upgrade instead of trying to survive them.
     passthrough = source_already_fits(orig_w, orig_h, aspect_ratio)
+    static_framing = os.environ.get("STATIC_FRAMING", "0").strip() == "1"
     if force_strategy:
         strategies = [force_strategy] * len(scenes)
         content_ranges = []  # no screencast/inset upgrades over an explicit choice
@@ -696,6 +706,10 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         content_ranges = []
         print(f"   ↕️  Source is already {orig_w}x{orig_h} vertical — "
               f"passing it through, no reframe")
+    elif static_framing:
+        strategies = ['GENERAL'] * len(scenes)
+        content_ranges = []
+        print("   🖥️ Static full-frame layout enabled; face tracking skipped.")
     else:
         strategies = m.analyze_scenes_strategy(input_video, scenes)
         if not content_ranges and screencast_layout.ENABLED:
@@ -708,7 +722,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # that begin past the last decoded frame, and those get dropped).
     splits = {}
     split_scene_of = {}
-    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+    detected_splits = {} if passthrough or static_framing else split_layout.detect_split_scenes(
         input_video, scenes, strategies)
     for scene_idx, centres in detected_splits.items():
         strategies[scene_idx] = 'SPLIT'
@@ -814,8 +828,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     cameraman = m.SmoothedCameraman(out_w, out_h, orig_w, orig_h, aspect_ratio=aspect_ratio)
     tracker = m.SpeakerTracker(cooldown_frames=30)
 
-    xs = _analyze_trajectory(input_video, scene_boundaries, strategies, fps,
-                             orig_w, orig_h, cameraman, tracker)
+    with timed_stage("face_tracking"):
+        xs = _analyze_trajectory(input_video, scene_boundaries, strategies, fps,
+                                 orig_w, orig_h, cameraman, tracker)
     if not xs:
         raise RuntimeError("analysis produced no frames")
 
@@ -921,8 +936,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 )
             specs.append((ss, dur, graph, boxes))
 
-        encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
-                      workdir, logo, final_output_video)
+        with timed_stage("final_encoding"):
+            encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
+                          workdir, logo, final_output_video)
     finally:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
