@@ -24,7 +24,8 @@ def test_job_options_keep_settings_and_drop_credentials():
     job = {"AUTO_LAYOUT": "1", "FFMPEG_THREADS": "2",           # same as the host
            "WATERMARK": "1", "CLIP_TARGET_MAX": "3", "MAX_SOURCE_MINUTES": "20",
            "GEMINI_API_KEY": "k", "PROXY_URL": "http://u:p@h", "STATIC_PROXY_URLS": "x",
-           "YOUTUBE_COOKIES": "c", "R2_SECRET_ACCESS_KEY": "s", "DATABASE_URL": "d",
+           "YOUTUBE_COOKIES": "c", "YOUTUBE_COOKIES_FILE": "/run/secrets/youtube-cookies.txt",
+           "R2_SECRET_ACCESS_KEY": "s", "DATABASE_URL": "d",
            "SOURCE_START_SECONDS": "90", "NVENC_SLOTS": "4", "PATH": "/x",
            "LD_PRELOAD": "/evil.so", "lower": "x", "BAD NAME": "x"}
     job.update(AUTO_HOOK_STYLE="pill", HF_ENDPOINT="http://evil", LLM_BASE_URL="http://evil",

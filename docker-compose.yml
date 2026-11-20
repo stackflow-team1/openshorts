@@ -8,8 +8,13 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      - ./secrets/youtube-cookies.txt:/run/secrets/youtube-cookies.txt:ro
+    group_add:
+      - "${YOUTUBE_COOKIES_GID:-1000}"
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
+      YOUTUBE_COOKIES_FILE: /run/secrets/youtube-cookies.txt
+      YOUTUBE_USER_AGENT: "${YOUTUBE_USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0}"
     restart: unless-stopped
 
   frontend:

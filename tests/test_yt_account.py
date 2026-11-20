@@ -375,6 +375,7 @@ def two_accounts(monkeypatch):
 
 def test_one_account_behaves_as_it_always_did(monkeypatch):
     monkeypatch.setenv("YOUTUBE_COOKIES", NETSCAPE)
+    monkeypatch.delenv("YOUTUBE_COOKIES_FILE", raising=False)
     monkeypatch.delenv("YOUTUBE_COOKIES_2", raising=False)
     s = yt_account.Session()
     try:
@@ -388,8 +389,56 @@ def test_one_account_behaves_as_it_always_did(monkeypatch):
 
 def test_no_account_means_no_cookie_file(monkeypatch):
     monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+    monkeypatch.delenv("YOUTUBE_COOKIES_FILE", raising=False)
     s = yt_account.Session()
     assert s.path is None and s.account is None and not s.spent
+
+
+def test_cookie_file_is_used_by_path_and_never_removed(tmp_path, monkeypatch):
+    cookie_file = tmp_path / "youtube-cookies.txt"
+    cookie_file.write_text(NETSCAPE)
+    monkeypatch.setenv("YOUTUBE_COOKIES_FILE", str(cookie_file))
+    monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+
+    session = yt_account.Session()
+    assert session.path == str(cookie_file)
+    session.close()
+    assert cookie_file.read_text() == NETSCAPE
+
+
+def test_cookie_file_can_move_to_an_inline_legacy_account(tmp_path, monkeypatch):
+    cookie_file = tmp_path / "youtube-cookies.txt"
+    cookie_file.write_text(NETSCAPE)
+    monkeypatch.setenv("YOUTUBE_COOKIES_FILE", str(cookie_file))
+    monkeypatch.setenv("YOUTUBE_COOKIES", SECOND)
+
+    session = yt_account.Session()
+    try:
+        assert session.account == 0 and session.path == str(cookie_file)
+        assert session.limited()
+        assert session.account == 1 and session.path != str(cookie_file)
+        assert open(session.path).read().strip() == SECOND.strip()
+        assert cookie_file.read_text() == NETSCAPE
+    finally:
+        session.close()
+
+
+def test_missing_cookie_file_falls_back_to_anonymous(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("YOUTUBE_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+
+    session = yt_account.Session()
+    assert session.path is None and session.account is None
+    warning = capsys.readouterr().out
+    assert "YOUTUBE_COOKIES_FILE is unavailable" in warning
+    assert str(tmp_path) not in warning and "SID" not in warning
+
+
+def test_youtube_requests_share_configured_user_agent_and_deno(monkeypatch):
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0"
+    monkeypatch.setenv("YOUTUBE_USER_AGENT", ua)
+    opts = yt_account.youtube_ydl_options()
+    assert opts == {"http_headers": {"User-Agent": ua}, "js_runtimes": {"deno": {}}}
 
 
 def test_consecutive_videos_take_consecutive_accounts(two_accounts):

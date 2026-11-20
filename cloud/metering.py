@@ -435,7 +435,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
             # exactly this (proxy_usage: `list=` and `results?search_query`).
             opts = {"skip_download": True, "quiet": True, "no_warnings": True,
                     "noplaylist": True,
-                    "logger": _QuietLogger(), "extractor_args": extractor_args}
+                    "logger": _QuietLogger(), "extractor_args": extractor_args,
+                    **yt_account.youtube_ydl_options()}
             authed = bool(ck_path and use_cookies)
             if authed and session.spent:
                 # YouTube said twice for this video (or, during a cooldown,
@@ -454,7 +455,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                 # With the cookies: one of the account's slots, spaced from
                 # the previous request (yt_account), like the download.
                 with (session.request() if authed else contextlib.nullcontext()):
-                    with ssrf_guard.guarded(), yt_dlp.YoutubeDL(opts) as ydl:
+                    with ssrf_guard.guarded(), yt_account.youtube_downloader(
+                            yt_dlp, opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                 if authed:
                     session.ok()

@@ -967,7 +967,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         print(f"🍪 Using YouTube account {yt_session.account + 1} of "
               f"{len(yt_account.accounts())}.")
     else:
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        print("⚠️ No YOUTUBE_COOKIES or readable YOUTUBE_COOKIES_FILE configured.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
@@ -1035,12 +1035,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             # playlist's), paying for all of them and keeping the last.
             'noplaylist': True,
             'extractor_args': extractor_args,
-            'http_headers': {
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                ),
-            },
+            **yt_account.youtube_ydl_options(),
         }
 
     # Wire bytes actually pulled through the (paid) proxy, summed across
@@ -1097,7 +1092,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             }
             # Own thread: the guard is per thread, so it is entered again here.
             import ssrf_guard
-            with ssrf_guard.guarded(), yt_dlp.YoutubeDL(opts) as ydl:
+            with ssrf_guard.guarded(), yt_account.youtube_downloader(yt_dlp, opts) as ydl:
                 res = ydl.process_ie_result(copy.deepcopy(info), download=True)
             path = ((res.get('requested_downloads') or [{}])[0].get('filepath')
                     or res.get('filepath'))
@@ -1118,7 +1113,8 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # account's slots and keeps its distance from the previous one
         # (yt_account): the account's request budget is shared by every job.
         with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
-            with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
+            with yt_account.youtube_downloader(
+                    yt_dlp, _base_opts(extractor_args, proxy, cookies)) as ydl:
                 info = ydl.extract_info(url, download=False, process=False)
         # Media URLs another program will fetch (ffmpeg on a ranged or HLS
         # download) resolve outside the Python guard: check them here. YouTube's
@@ -1160,7 +1156,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             dl_opts['download_ranges'] = download_range_func(None, [(0, _range_cap)])
             print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
                   f": downloading only the first {_range_cap / 60:.0f} min.")
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+        with yt_account.youtube_downloader(yt_dlp, dl_opts) as ydl:
             if info.get('_type', 'video') == 'video' and info.get('formats'):
                 ydl.process_ie_result(info, download=True)
             else:

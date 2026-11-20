@@ -34,7 +34,7 @@ import json
 import os
 import random
 import re
-import tempfile
+import contextlib
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
@@ -338,16 +338,14 @@ def fetch_transcript(video_id: str, lang: Optional[str] = None) -> dict:
     import yt_dlp
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    ck_path = None
     errors = []
+    import yt_account
+    session = yt_account.Session()
     try:
-        if cookies_env:
-            fd, ck_path = tempfile.mkstemp(prefix="tool_ck_", suffix=".txt")
-            with os.fdopen(fd, "w") as f:
-                f.write(cookies_env)
         for proxy in transcript_routes():
-            for use_cookies in ([False, True] if ck_path else [False]):
+            for use_cookies in ([False, True] if session.path else [False]):
+                if use_cookies and (session.spent or yt_account.cooling_down() > 0):
+                    continue
                 opts = {"skip_download": True, "quiet": True, "no_warnings": True,
                         "noplaylist": True, "logger": _QuietLogger(),
                         "socket_timeout": 15,
@@ -355,46 +353,50 @@ def fetch_transcript(video_id: str, lang: Optional[str] = None) -> dict:
                         # SABR-only fails with "Requested format is not available"
                         # although its caption list came back fine.
                         "ignore_no_formats_error": True,
-                        "extractor_args": {"youtube": {"player_client": ["default"]}}}
+                        "extractor_args": {"youtube": {"player_client": ["default"]}},
+                        **yt_account.youtube_ydl_options()}
                 if proxy:
                     opts["proxy"] = proxy
                 if use_cookies:
-                    opts["cookiefile"] = ck_path
+                    opts["cookiefile"] = session.path
                 try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        kind, key, languages = choose_track(info, lang)
-                        meta = {
-                            "video_id": video_id,
-                            "title": info.get("title") or "",
-                            "channel": info.get("channel") or info.get("uploader") or "",
-                            "duration": info.get("duration") or 0,
-                            "languages": languages,
-                        }
-                        if not kind and is_degraded(info):
-                            # A degraded answer: anonymous requests from two
-                            # of the three statics got the watch page without
-                            # its player response (title, but no duration, no
-                            # formats, no captions) for a TED talk with 49
-                            # human tracks (23-sep-2026); the same routes with
-                            # the cookies answered in full. That is the route,
-                            # not the video: try the next attempt.
-                            errors.append("empty player response")
-                            continue
-                        if not kind:
-                            raise TranscriptError(
-                                "no_captions",
-                                "This video has no captions on YouTube, not even automatic ones.",
-                                404)
-                        pool = (info.get("subtitles") if kind == "manual"
-                                else info.get("automatic_captions")) or {}
-                        fmt = next((f for f in pool.get(key, []) if f.get("ext") == "json3"), None)
-                        if not fmt:
-                            raise TranscriptError(
-                                "no_captions",
-                                "YouTube lists captions for this video but does not serve them in a readable format.",
-                                404)
-                        raw = ydl.urlopen(fmt["url"]).read()
+                    with (session.request() if use_cookies else contextlib.nullcontext()):
+                        with yt_account.youtube_downloader(yt_dlp, opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                            if use_cookies:
+                                session.ok()
+                            kind, key, languages = choose_track(info, lang)
+                            meta = {
+                                "video_id": video_id,
+                                "title": info.get("title") or "",
+                                "channel": info.get("channel") or info.get("uploader") or "",
+                                "duration": info.get("duration") or 0,
+                                "languages": languages,
+                            }
+                            if not kind and is_degraded(info):
+                                # A degraded answer: anonymous requests from two
+                                # of the three statics got the watch page without
+                                # its player response (title, but no duration, no
+                                # formats, no captions) for a TED talk with 49
+                                # human tracks (23-sep-2026); the same routes with
+                                # the cookies answered in full. That is the route,
+                                # not the video: try the next attempt.
+                                errors.append("empty player response")
+                                continue
+                            if not kind:
+                                raise TranscriptError(
+                                    "no_captions",
+                                    "This video has no captions on YouTube, not even automatic ones.",
+                                    404)
+                            pool = (info.get("subtitles") if kind == "manual"
+                                    else info.get("automatic_captions")) or {}
+                            fmt = next((f for f in pool.get(key, []) if f.get("ext") == "json3"), None)
+                            if not fmt:
+                                raise TranscriptError(
+                                    "no_captions",
+                                    "YouTube lists captions for this video but does not serve them in a readable format.",
+                                    404)
+                            raw = ydl.urlopen(fmt["url"]).read()
                     segments = parse_json3(raw)
                     if not segments:
                         raise TranscriptError(
@@ -406,6 +408,8 @@ def fetch_transcript(video_id: str, lang: Optional[str] = None) -> dict:
                 except Exception as e:  # noqa: BLE001 — classified below
                     msg = str(e)
                     errors.append(msg[:300])
+                    if use_cookies and yt_account.is_rate_limit(msg):
+                        session.limited()
                     if _UNAVAILABLE.search(msg) and not re.search(r"not a bot", msg, re.I):
                         raise TranscriptError(
                             "unavailable",
@@ -416,11 +420,7 @@ def fetch_transcript(video_id: str, lang: Optional[str] = None) -> dict:
             "YouTube is not answering our servers right now. Try again in a minute, or open "
             "the video on YouTube and use \"Show transcript\" under the description.", 503)
     finally:
-        if ck_path:
-            try:
-                os.remove(ck_path)
-            except OSError:
-                pass
+        session.close()
 
 
 def _fetch_with_slot(video_id, lang):

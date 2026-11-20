@@ -32,6 +32,10 @@ on. A video whose account is limited moves to another one that is not resting
 before it gives up. With every account resting the one closest to waking is
 used: no cookies at all is worse than a limited account.
 
+``YOUTUBE_COOKIES_FILE`` adds a read-only cookie-file account without copying
+its contents. The same User-Agent and JavaScript runtime options are shared by
+metadata probes and downloads.
+
 Fail-open everywhere: a state directory that cannot be written, a lock that
 never frees, a clock that jumped: the request goes ahead as it always did.
 """
@@ -86,6 +90,11 @@ REST_SECONDS = _float_env("YT_ACCOUNT_REST_SECONDS", 900)
 REST_STRIKES = _int_env("YT_ACCOUNT_REST_STRIKES", 3)
 MAX_ACCOUNTS = 9
 
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_MISSING_COOKIE_FILES = set()
 _COOLDOWN_FILE = ".yt-account.cooldown"
 _REST_FILE = ".yt-account-rest-{}"
 _TURN_FILE = ".yt-account.turn"
@@ -112,6 +121,31 @@ def is_age_gate(text) -> bool:
     """Whether an error text is YouTube refusing an age-restricted video."""
     t = str(text or "").lower()
     return any(m in t for m in _AGE_MARKERS)
+
+
+def youtube_ydl_options():
+    """Shared yt-dlp request settings for YouTube extraction and downloads."""
+    return {
+        "http_headers": {
+            "User-Agent": os.environ.get("YOUTUBE_USER_AGENT", "").strip()
+            or _DEFAULT_USER_AGENT,
+        },
+        "js_runtimes": {"deno": {}},
+    }
+
+
+@contextlib.contextmanager
+def youtube_downloader(yt_dlp_module, options):
+    """Use a mounted cookie file as input only; yt-dlp otherwise saves to it."""
+    downloader = yt_dlp_module.YoutubeDL(options)
+    cookiefile = options.get("cookiefile")
+    configured_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    if (cookiefile and configured_file
+            and os.path.abspath(cookiefile) == os.path.abspath(configured_file)):
+        downloader.cookiejar
+        downloader.params["cookiefile"] = None
+    with downloader as ydl:
+        yield ydl
 
 
 def state_dir():
@@ -281,15 +315,28 @@ def request(account=0):
 # --- several accounts ------------------------------------------------------
 
 def accounts(env=None):
-    """The cookie files configured, in order: YOUTUBE_COOKIES, then
-    YOUTUBE_COOKIES_2 .. _9. Empty ones are skipped."""
+    """Configured cookie sources, in order: file, YOUTUBE_COOKIES, then
+    YOUTUBE_COOKIES_2 .. _9. File sources are passed to yt-dlp by path."""
     env = os.environ if env is None else env
-    names = ["YOUTUBE_COOKIES"] + [f"YOUTUBE_COOKIES_{i}" for i in range(2, MAX_ACCOUNTS + 1)]
     out = []
+    path = str(env.get("YOUTUBE_COOKIES_FILE") or "").strip()
+    if path:
+        try:
+            if not os.path.isfile(path):
+                raise OSError
+            with open(path, "rb"):
+                pass
+        except OSError:
+            if path not in _MISSING_COOKIE_FILES:
+                print("⚠️ YOUTUBE_COOKIES_FILE is unavailable; continuing without file cookies.")
+                _MISSING_COOKIE_FILES.add(path)
+        else:
+            out.append(("file", os.path.abspath(path)))
+    names = ["YOUTUBE_COOKIES"] + [f"YOUTUBE_COOKIES_{i}" for i in range(2, MAX_ACCOUNTS + 1)]
     for name in names:
         text = str(env.get(name) or "").strip()
         if text:
-            out.append(text + "\n")
+            out.append(("text", text + "\n"))
     return out
 
 
@@ -418,7 +465,8 @@ class Session:
     move to another account when YouTube limits this one.
 
     ``path`` is None without any account configured (self-host without
-    cookies, the remote worker): callers then run anonymous, as before."""
+    cookies, the remote worker): callers then run anonymous, as before.
+    A configured cookie-file path is borrowed, never rewritten or removed."""
 
     _live = {}      # cookie file path -> its Session, in this process
 
@@ -429,17 +477,19 @@ class Session:
         found = cls._live.get(path)
         if found is None:
             found = cls.__new__(cls)
-            found._texts, found._tried = [], set()
+            found._accounts, found._tried = [], set()
             found.account, found.path, found.answers = None, path, 0
+            found._owns_path = False
         return found
 
     def __init__(self):
-        self._texts = accounts()
+        self._accounts = accounts()
         self._tried = set()
         self.account = None
         self.path = None
+        self._owns_path = False
         self.answers = 0
-        self._use(pick(count=len(self._texts)))
+        self._use(pick(count=len(self._accounts)))
         if self.path:
             Session._live[self.path] = self
             atexit.register(self.close)
@@ -447,22 +497,47 @@ class Session:
     def _use(self, account):
         if account is None:
             return False
+        kind, value = self._accounts[account]
         try:
-            if self.path is None:
-                fd, self.path = tempfile.mkstemp(prefix="yt_ck_", suffix=".txt")
-                os.close(fd)
-            # Rewritten in place: the path is already inside the options of
-            # the caller's next attempt.
-            with open(self.path, "w") as f:
-                f.write(self._texts[account])
-            os.chmod(self.path, 0o600)
-        except OSError:
-            if self.account is None:
+            if self.path and Session._live.get(self.path) is self:
+                Session._live.pop(self.path, None)
+            if self._owns_path and self.path:
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
                 self.path = None
+                self._owns_path = False
+            if kind == "file":
+                if not os.path.isfile(value):
+                    self.path = None
+                    return False
+                with open(value, "rb"):
+                    pass
+                self.path = value
+            else:
+                if not self._owns_path:
+                    self.path = None
+                if self.path is None:
+                    fd, self.path = tempfile.mkstemp(prefix="yt_ck_", suffix=".txt")
+                    os.close(fd)
+                    self._owns_path = True
+                with open(self.path, "w") as f:
+                    f.write(value)
+                os.chmod(self.path, 0o600)
+        except OSError:
+            if self._owns_path and self.path:
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
+            self.path = None
+            self._owns_path = False
             return False
         self.account = account
         self._tried.add(account)
         self.answers = 0
+        Session._live[self.path] = self
         return True
 
     @property
@@ -483,7 +558,7 @@ class Session:
         another account (its next attempt uses it)."""
         note_rate_limited()
         note_account_limited(self.account)
-        if self._use(pick(exclude=self._tried, awake_only=True, count=len(self._texts))):
+        if self._use(pick(exclude=self._tried, awake_only=True, count=len(self._accounts))):
             return True
         self.answers += 1
         return False
@@ -493,7 +568,7 @@ class Session:
         account is not age-verified). True when the video moved to an account
         it has not tried yet, preferring one that is not resting. Not a strike
         against the account: it is fine for every other video."""
-        n = len(self._texts)
+        n = len(self._accounts)
         nxt = pick(exclude=self._tried, awake_only=True, count=n)
         if nxt is None:
             nxt = pick(exclude=self._tried, awake_only=False, count=n)
@@ -505,8 +580,11 @@ class Session:
             # A long-lived process (the API's probe pool) would otherwise keep
             # every Session it ever opened, through its atexit hook.
             atexit.unregister(self.close)
-            Session._live.pop(path, None)
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            if Session._live.get(path) is self:
+                Session._live.pop(path, None)
+            if self._owns_path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self._owns_path = False

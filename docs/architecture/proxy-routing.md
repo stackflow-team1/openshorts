@@ -20,7 +20,8 @@ old `best[ext=mp4]` spec was itself the 360p progressive file).
 
 ## Cookies: first attempt with, second without
 
-The probe carries `YOUTUBE_COOKIES`, like the download does: an anonymous probe
+The probe carries `YOUTUBE_COOKIES_FILE` (a mounted Netscape cookie file) or
+the legacy `YOUTUBE_COOKIES`, like the download does: an anonymous probe
 from datacenter IPs gets "Sign in to confirm you're not a bot" in bursts, while
 the authenticated request goes through the same IPs. But the **first** attempt
 on a route carries the cookies and the second drops them, on the probe as on the
@@ -29,6 +30,11 @@ videos, while the same video anonymously on the same IP returns 1080p. Without
 the anonymous second attempt the probe reads a cookie problem as an IP problem
 and escalates to the per-GB proxy, which carries the same cookies and fails
 identically.
+
+`YOUTUBE_USER_AGENT` and yt-dlp's Deno runtime are shared by the metadata probe
+and download. In Docker Compose, the cookie file is mounted read-only into the
+backend at `/run/secrets/youtube-cookies.txt`; it is not mounted into the
+frontend or renderer.
 
 ## When the per-GB proxy is allowed
 

@@ -87,6 +87,7 @@ def main() -> int:
             # A watch?v=X&list=... link is the one video; without this
             # yt-dlp walks the whole list (see cloud/metering.py).
             'noplaylist': True,
+            **yt_account.youtube_ydl_options(),
         }
         # yt-dlp's default player clients (tv_downgraded/web_safari with
         # cookies, android_vr/web_safari anonymous) are the ones that still
@@ -102,7 +103,8 @@ def main() -> int:
             authed = mode == "cookie-auth"
             try:
                 with (session.request() if authed else contextlib.nullcontext()):
-                    with ssrf_guard.guarded(), yt_dlp.YoutubeDL(opts) as ydl:
+                    with ssrf_guard.guarded(), yt_account.youtube_downloader(
+                            yt_dlp, opts) as ydl:
                         info = ydl.extract_info(args.url, download=False)
                 if authed:
                     session.ok()

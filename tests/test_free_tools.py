@@ -271,10 +271,14 @@ class _FakeYDL:
     script of per-route outcomes."""
     script = []
     seen = []
+    instances = []
 
     def __init__(self, opts):
         self.opts = opts
+        self.params = dict(opts)
+        self.cookiejar = object()
         _FakeYDL.seen.append(opts)
+        _FakeYDL.instances.append(self)
 
     def __enter__(self):
         return self
@@ -310,8 +314,40 @@ def fake_ydl(monkeypatch):
 
     monkeypatch.setattr(ssrf_guard, "guarded", lambda: _Guard())
     monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_FakeYDL))
-    _FakeYDL.script, _FakeYDL.seen = [], []
+    _FakeYDL.script, _FakeYDL.seen, _FakeYDL.instances = [], [], []
     return guarded_calls
+
+
+def test_youtube_transcript_uses_cookie_file_and_shared_ydl_settings(
+        fake_ydl, monkeypatch, tmp_path):
+    import yt_account
+
+    cookie_file = tmp_path / "youtube-cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\nexample-cookie\n")
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0"
+    monkeypatch.setenv("YOUTUBE_COOKIES_FILE", str(cookie_file))
+    monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+    monkeypatch.delenv("STATIC_PROXY_URLS", raising=False)
+    monkeypatch.setenv("YOUTUBE_USER_AGENT", ua)
+    monkeypatch.setenv("YT_ACCOUNT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ft, "parse_json3", lambda raw: [{"start": 0, "dur": 1, "text": "hello"}])
+    _FakeYDL.script = [
+        RuntimeError("temporary network failure"),
+        {"language": "en", "duration": 1,
+         "subtitles": {"en": _fmt()}, "automatic_captions": {}},
+    ]
+
+    result = ft.fetch_transcript("arj7oStGLkU")
+
+    assert result["segments"] == [{"start": 0, "dur": 1, "text": "hello"}]
+    assert len(_FakeYDL.seen) == 2
+    for opts in _FakeYDL.seen:
+        assert opts["http_headers"]["User-Agent"] == ua
+        assert opts["js_runtimes"] == {"deno": {}}
+    assert _FakeYDL.seen[0].get("cookiefile") is None
+    assert _FakeYDL.seen[1]["cookiefile"] == str(cookie_file)
+    assert _FakeYDL.instances[1].params["cookiefile"] is None
+    assert cookie_file.read_text() == "# Netscape HTTP Cookie File\nexample-cookie\n"
 
 
 _TT_INFO = {"id": "7701728720121236749", "title": "camp", "uploader": "garyvee",
